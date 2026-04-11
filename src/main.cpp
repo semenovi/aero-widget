@@ -213,6 +213,10 @@ static bool g_procAbsMode[NUM_CHARTS] = {};
 // Click rects for process lists (local window coordinates)
 static D2D1_RECT_F g_procListRects[NUM_CHARTS] = {};
 
+// Hover state for process list tiles (main-thread only)
+static int g_hoveredProcList = -1; // 0..3 = tile index; -1 = none
+static int g_hoveredProcRow  = -1; // entry row index within tile; -1 = none/title
+
 // Second vertical divider (between charts and process lists)
 static float g_dividerX2    = 0.f;
 static bool  g_draggingDiv2 = false;
@@ -260,16 +264,25 @@ static void FlushDisplayValues()
         wcscpy_s(g_diskCharts[i].displayAbsStr, g_diskCharts[i].absStr);
     }
 
-    // Sample and flush process lists at the same rate as chart labels
+    // Sample and flush process lists at the same rate as chart labels.
+    // Skip flushing whichever tile the mouse is currently hovering over (freeze on hover).
     SampleProcesses();
-    g_dispProcCpuCount  = g_procCpuCount;
-    g_dispProcGpuCount  = g_procGpuCount;
-    g_dispProcRamCount  = g_procRamCount;
-    g_dispProcDiskCount = g_procDiskCount;
-    if (g_procCpuCount  > 0) memcpy(g_dispProcCpu,  g_procCpu,  g_procCpuCount  * sizeof(ProcEntry));
-    if (g_procGpuCount  > 0) memcpy(g_dispProcGpu,  g_procGpu,  g_procGpuCount  * sizeof(ProcEntry));
-    if (g_procRamCount  > 0) memcpy(g_dispProcRam,  g_procRam,  g_procRamCount  * sizeof(ProcEntry));
-    if (g_procDiskCount > 0) memcpy(g_dispProcDisk, g_procDisk, g_procDiskCount * sizeof(ProcEntry));
+    if (g_hoveredProcList != 0) {
+        g_dispProcCpuCount = g_procCpuCount;
+        if (g_procCpuCount > 0) memcpy(g_dispProcCpu, g_procCpu, g_procCpuCount * sizeof(ProcEntry));
+    }
+    if (g_hoveredProcList != 1) {
+        g_dispProcGpuCount = g_procGpuCount;
+        if (g_procGpuCount > 0) memcpy(g_dispProcGpu, g_procGpu, g_procGpuCount * sizeof(ProcEntry));
+    }
+    if (g_hoveredProcList != 2) {
+        g_dispProcRamCount = g_procRamCount;
+        if (g_procRamCount > 0) memcpy(g_dispProcRam, g_procRam, g_procRamCount * sizeof(ProcEntry));
+    }
+    if (g_hoveredProcList != 3) {
+        g_dispProcDiskCount = g_procDiskCount;
+        if (g_procDiskCount > 0) memcpy(g_dispProcDisk, g_procDisk, g_procDiskCount * sizeof(ProcEntry));
+    }
 }
 
 // Draw text with character-level ellipsis trimming when it overflows rect width.
@@ -2762,6 +2775,27 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
                 g_habrHover = newHover;
                 UpdateLayeredContent(hwnd);
             }
+
+            // Track which process list tile and row the mouse is over
+            int newProcList = -1, newProcRow = -1;
+            const float lineH = g_fontSize * 1.4f;
+            for (int i = 0; i < NUM_CHARTS; ++i)
+            {
+                if ((float)mx >= g_procListRects[i].left  &&
+                    (float)mx <= g_procListRects[i].right &&
+                    (float)my >= g_procListRects[i].top   &&
+                    (float)my <= g_procListRects[i].bottom)
+                {
+                    newProcList = i;
+                    float relY = (float)my - g_procListRects[i].top;
+                    float afterTitle = lineH + 2.f;
+                    if (relY >= afterTitle)
+                        newProcRow = (int)((relY - afterTitle) / lineH);
+                    break;
+                }
+            }
+            g_hoveredProcList = newProcList;
+            g_hoveredProcRow  = newProcRow;
         }
         return 0;
     }
@@ -2773,6 +2807,8 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
             g_habrHover = -1;
             UpdateLayeredContent(hwnd);
         }
+        g_hoveredProcList = -1;
+        g_hoveredProcRow  = -1;
         break;
     }
 
@@ -2862,9 +2898,68 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
         return 0;
 
     case WM_NCRBUTTONUP:
-    case WM_RBUTTONUP:
         DestroyWindow(hwnd);
         return 0;
+
+    case WM_RBUTTONUP:
+    {
+        int mx = GET_X_LPARAM(lParam);
+        int my = GET_Y_LPARAM(lParam);
+
+        // Check if the click is on a process list entry; if so, kill that process.
+        bool handled = false;
+        const float lineH = g_fontSize * 1.4f;
+        for (int i = 0; i < NUM_CHARTS; ++i)
+        {
+            if ((float)mx >= g_procListRects[i].left  &&
+                (float)mx <= g_procListRects[i].right &&
+                (float)my >= g_procListRects[i].top   &&
+                (float)my <= g_procListRects[i].bottom)
+            {
+                float relY = (float)my - g_procListRects[i].top;
+                float afterTitle = lineH + 2.f;
+                if (relY >= afterTitle)
+                {
+                    int row = (int)((relY - afterTitle) / lineH);
+                    const ProcEntry* arrs[NUM_CHARTS] = {
+                        g_dispProcCpu, g_dispProcGpu, g_dispProcRam, g_dispProcDisk
+                    };
+                    int cnts[NUM_CHARTS] = {
+                        g_dispProcCpuCount, g_dispProcGpuCount,
+                        g_dispProcRamCount, g_dispProcDiskCount
+                    };
+                    if (row >= 0 && row < cnts[i])
+                    {
+                        const wchar_t* targetName = arrs[i][row].name;
+                        HANDLE snap = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
+                        if (snap != INVALID_HANDLE_VALUE)
+                        {
+                            PROCESSENTRY32W pe = { sizeof(pe) };
+                            if (Process32FirstW(snap, &pe))
+                            {
+                                do {
+                                    wchar_t peName[64];
+                                    NormalizeProcessName(pe.szExeFile, peName, 64);
+                                    if (_wcsicmp(peName, targetName) == 0)
+                                    {
+                                        HANDLE hp = OpenProcess(PROCESS_TERMINATE, FALSE,
+                                                                pe.th32ProcessID);
+                                        if (hp) { TerminateProcess(hp, 1); CloseHandle(hp); }
+                                    }
+                                } while (Process32NextW(snap, &pe));
+                            }
+                            CloseHandle(snap);
+                        }
+                    }
+                }
+                handled = true;
+                break;
+            }
+        }
+        if (!handled)
+            DestroyWindow(hwnd);
+        return 0;
+    }
 
     // ------------------------------------------------------------------
     case WM_DESTROY:
