@@ -123,6 +123,19 @@ struct Chart
 static const int NUM_CHARTS = 4;
 static Chart g_charts[NUM_CHARTS]; // 0=CPU, 1=GPU, 2=RAM, 3=Disk
 
+// -----------------------------------------------------------------------
+// Per-core CPU state
+// -----------------------------------------------------------------------
+static const int MAX_CORES = 128;
+static int    g_cpuMode           = 0; // 0=total, 1=logical cores, 2=physical cores
+static int    g_logicalCoreCount  = 0;
+static int    g_physicalCoreCount = 0;
+static int    g_logicalToPhysical[MAX_CORES] = {}; // logical idx → physical idx
+static Chart  g_logicalCharts[MAX_CORES]     = {};
+static Chart  g_physicalCharts[MAX_CORES]    = {};
+static PDH_HCOUNTER g_pdhCoreCtr = NULL;
+static D2D1_RECT_F  g_cpuChartRect = {};  // CPU row rect (local coords), for click detection
+
 static void PushChartValue(Chart& c, double v)
 {
     c.values[c.head] = v;
@@ -137,6 +150,16 @@ static void FlushDisplayValues()
     {
         g_charts[i].displayCurrent = g_charts[i].current;
         wcscpy_s(g_charts[i].displayAbsStr, g_charts[i].absStr);
+    }
+    for (int i = 0; i < g_logicalCoreCount; ++i)
+    {
+        g_logicalCharts[i].displayCurrent = g_logicalCharts[i].current;
+        wcscpy_s(g_logicalCharts[i].displayAbsStr, g_logicalCharts[i].absStr);
+    }
+    for (int i = 0; i < g_physicalCoreCount; ++i)
+    {
+        g_physicalCharts[i].displayCurrent = g_physicalCharts[i].current;
+        wcscpy_s(g_physicalCharts[i].displayAbsStr, g_physicalCharts[i].absStr);
     }
 }
 
@@ -172,7 +195,8 @@ static void DrawTextEllipsis(ID2D1RenderTarget* rt,
 
 static void DrawChart(ID2D1RenderTarget* rt, const Chart& c,
                       D2D1_RECT_F area,
-                      IDWriteTextFormat* fmtL, IDWriteTextFormat* fmtR)
+                      IDWriteTextFormat* fmtL, IDWriteTextFormat* fmtR,
+                      int maxSamples = CHART_SAMPLES)
 {
     const float margin = 8.f;
     const float labelH = g_fontSize * 1.4f;
@@ -228,7 +252,7 @@ static void DrawChart(ID2D1RenderTarget* rt, const Chart& c,
 
     rt->DrawRectangle(plotArea, pBrush, 0.75f);
 
-    const int n = c.count;
+    const int n = min(c.count, maxSamples);
     if (n >= 2)
     {
         const float left   = plotArea.left   + 2.f;
@@ -406,10 +430,11 @@ static void SaveWindowState(HWND hwnd)
         "    \"win_w\": %d,\n"
         "    \"win_h\": %d,\n"
         "    \"divider_x\": %.2f,\n"
-        "    \"divider_y\": %.2f\n"
+        "    \"divider_y\": %.2f,\n"
+        "    \"cpu_mode\": %d\n"
         "}\n",
         escaped, monL, monT, relX, relY, winW, winH,
-        (double)g_dividerX, (double)g_dividerY);
+        (double)g_dividerX, (double)g_dividerY, g_cpuMode);
     fclose(f);
 }
 
@@ -524,6 +549,10 @@ static void LoadConfig()
     int habrMin = 0;
     if (JsonInt(buf, "habr_refresh_minutes", &habrMin) && habrMin > 0)
         g_habrRefreshMin = habrMin;
+
+    int cpuMode = 0;
+    if (JsonInt(buf, "cpu_mode", &cpuMode) && cpuMode >= 0 && cpuMode <= 2)
+        g_cpuMode = cpuMode;
 }
 
 // -----------------------------------------------------------------------
@@ -1139,6 +1168,110 @@ static void GetDiskName(wchar_t* buf, int len)
 }
 
 // -----------------------------------------------------------------------
+// Core topology detection
+// -----------------------------------------------------------------------
+static void DetectCoreTopology()
+{
+    SYSTEM_INFO si = {};
+    GetSystemInfo(&si);
+    g_logicalCoreCount = (int)si.dwNumberOfProcessors;
+    if (g_logicalCoreCount > MAX_CORES) g_logicalCoreCount = MAX_CORES;
+
+    for (int i = 0; i < g_logicalCoreCount; i++)
+        g_logicalToPhysical[i] = i; // default 1:1
+
+    DWORD sz = 0;
+    GetLogicalProcessorInformation(nullptr, &sz);
+    if (sz > 0)
+    {
+        auto* buf = (SYSTEM_LOGICAL_PROCESSOR_INFORMATION*)malloc(sz);
+        if (buf)
+        {
+            if (GetLogicalProcessorInformation(buf, &sz))
+            {
+                int n = (int)(sz / sizeof(SYSTEM_LOGICAL_PROCESSOR_INFORMATION));
+                int physIdx = 0;
+                for (int i = 0; i < n; i++)
+                {
+                    if (buf[i].Relationship == RelationProcessorCore)
+                    {
+                        ULONG_PTR mask = buf[i].ProcessorMask;
+                        for (int bit = 0; bit < MAX_CORES; bit++)
+                            if (mask & ((ULONG_PTR)1 << bit))
+                                g_logicalToPhysical[bit] = physIdx;
+                        physIdx++;
+                    }
+                }
+                g_physicalCoreCount = physIdx ? physIdx : g_logicalCoreCount;
+            }
+            else
+                g_physicalCoreCount = g_logicalCoreCount;
+            free(buf);
+        }
+        else
+            g_physicalCoreCount = g_logicalCoreCount;
+    }
+    else
+        g_physicalCoreCount = g_logicalCoreCount;
+
+    for (int i = 0; i < g_logicalCoreCount; i++)
+        swprintf_s(g_logicalCharts[i].name, L"L%d", i);
+    for (int i = 0; i < g_physicalCoreCount; i++)
+        swprintf_s(g_physicalCharts[i].name, L"P%d", i);
+}
+
+// Sample per-core CPU usage via PDH wildcard counter
+static void SampleCores()
+{
+    if (!g_pdhCoreCtr || g_logicalCoreCount == 0) return;
+
+    DWORD sz = 0, cnt = 0;
+    PdhGetFormattedCounterArrayW(g_pdhCoreCtr, PDH_FMT_DOUBLE, &sz, &cnt, nullptr);
+    if (sz == 0) return;
+
+    auto* items = (PDH_FMT_COUNTERVALUE_ITEM_W*)malloc(sz);
+    if (!items) return;
+
+    double logVals[MAX_CORES] = {};
+
+    if (PdhGetFormattedCounterArrayW(g_pdhCoreCtr, PDH_FMT_DOUBLE, &sz, &cnt, items) == ERROR_SUCCESS)
+    {
+        for (DWORD j = 0; j < cnt; j++)
+        {
+            if (items[j].FmtValue.CStatus != PDH_CSTATUS_VALID_DATA) continue;
+            const wchar_t* nm = items[j].szName;
+            if (wcscmp(nm, L"_Total") == 0) continue;
+            // Instance may be "N" or "G,N" (processor group format)
+            int coreIdx = -1;
+            const wchar_t* comma = wcschr(nm, L',');
+            if (comma)
+                coreIdx = _wtoi(nm) * 64 + _wtoi(comma + 1);
+            else
+                coreIdx = _wtoi(nm);
+            if (coreIdx >= 0 && coreIdx < g_logicalCoreCount)
+                logVals[coreIdx] = items[j].FmtValue.doubleValue / 100.0;
+        }
+    }
+    free(items);
+
+    // Push logical core values
+    for (int i = 0; i < g_logicalCoreCount; i++)
+        PushChartValue(g_logicalCharts[i], max(0.0, min(logVals[i], 1.0)));
+
+    // Aggregate logical → physical cores
+    double physSum[MAX_CORES] = {};
+    int    physCnt[MAX_CORES] = {};
+    for (int i = 0; i < g_logicalCoreCount; i++)
+    {
+        int p = g_logicalToPhysical[i];
+        if (p >= 0 && p < MAX_CORES) { physSum[p] += logVals[i]; physCnt[p]++; }
+    }
+    for (int p = 0; p < g_physicalCoreCount; p++)
+        PushChartValue(g_physicalCharts[p],
+            physCnt[p] > 0 ? max(0.0, min(physSum[p] / physCnt[p], 1.0)) : 0.0);
+}
+
+// -----------------------------------------------------------------------
 // Sample all four metrics into charts
 // -----------------------------------------------------------------------
 static void SampleMetrics()
@@ -1263,6 +1396,8 @@ static void SampleMetrics()
                 swprintf_s(g_charts[3].absStr, L"%.1f MB/s", val.doubleValue / (1024.0 * 1024.0));
         }
     }
+
+    SampleCores();
 }
 
 // -----------------------------------------------------------------------
@@ -1349,12 +1484,35 @@ static void UpdateLayeredContent(HWND hwnd)
             const float colW = (float)w - chartLeft - PAD;
             const float rowH = ((float)h - 2.f * VEDGE - (NUM_CHARTS - 1) * PAD) / NUM_CHARTS;
 
+            // Store CPU row rect for click detection (always the top row)
+            g_cpuChartRect = { chartLeft, VEDGE, chartLeft + colW, VEDGE + rowH };
+
             for (int i = 0; i < NUM_CHARTS; ++i)
             {
                 float x = chartLeft;
                 float y = VEDGE + i * (rowH + PAD);
                 D2D1_RECT_F area = { x, y, x + colW, y + rowH };
-                DrawChart(g_pDCRT, g_charts[i], area, g_pChartFmtL, g_pChartFmtR);
+
+                if (i == 0 && g_cpuMode != 0)
+                {
+                    // Expanded per-core view: N mini charts side by side in one row.
+                    // Each mini chart shows samples proportional to its width so the
+                    // time-density matches the full-width chart.
+                    const Chart* cores   = (g_cpuMode == 1) ? g_logicalCharts  : g_physicalCharts;
+                    int coreCount        = (g_cpuMode == 1) ? g_logicalCoreCount : g_physicalCoreCount;
+                    if (coreCount < 1) coreCount = 1;
+                    int miniSamples = max(2, CHART_SAMPLES / coreCount);
+                    float miniW = colW / (float)coreCount;
+                    for (int c = 0; c < coreCount; c++)
+                    {
+                        D2D1_RECT_F mini = { x + c * miniW, y, x + (c + 1) * miniW, y + rowH };
+                        DrawChart(g_pDCRT, cores[c], mini, g_pChartFmtL, g_pChartFmtR, miniSamples);
+                    }
+                }
+                else
+                {
+                    DrawChart(g_pDCRT, g_charts[i], area, g_pChartFmtL, g_pChartFmtR);
+                }
             }
         }
 
@@ -1451,6 +1609,8 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
         GetRamName (g_charts[2].name, 256);
         GetDiskName(g_charts[3].name, 256);
 
+        DetectCoreTopology();
+
         if (PdhOpenQuery(NULL, 0, &g_pdhQuery) == ERROR_SUCCESS)
         {
             PdhAddEnglishCounterW(g_pdhQuery,
@@ -1471,6 +1631,9 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
             PdhAddEnglishCounterW(g_pdhQuery,
                 L"\\GPU Adapter Memory(*)\\Dedicated Usage",
                 0, &g_pdhGpuMemCtr);
+            PdhAddEnglishCounterW(g_pdhQuery,
+                L"\\Processor(*)\\% Processor Time",
+                0, &g_pdhCoreCtr);
             PdhCollectQueryData(g_pdhQuery);
         }
 
@@ -1580,6 +1743,11 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
             my > (int)g_dividerY + DIV_HIT && my < wh - (int)VEDGE)
             return HTCLIENT;
 
+        // CPU chart row (right panel, top row) → client so click fires
+        if ((float)mx >= g_cpuChartRect.left && (float)mx <= g_cpuChartRect.right &&
+            (float)my >= g_cpuChartRect.top  && (float)my <= g_cpuChartRect.bottom)
+            return HTCLIENT;
+
         return HTCAPTION;
     }
 
@@ -1633,6 +1801,16 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
         {
             g_draggingDivH = true;
             SetCapture(hwnd);
+        }
+        else if ((float)mx >= g_cpuChartRect.left && (float)mx <= g_cpuChartRect.right &&
+                 (float)my >= g_cpuChartRect.top  && (float)my <= g_cpuChartRect.bottom)
+        {
+            // Cycle CPU mode: 0 (total) → 1 (logical) → 2 (physical, if SMT) → 0
+            int maxMode = (g_physicalCoreCount > 0 &&
+                           g_physicalCoreCount != g_logicalCoreCount) ? 2 : 1;
+            g_cpuMode = (g_cpuMode + 1) % (maxMode + 1);
+            SaveWindowState(hwnd);
+            UpdateLayeredContent(hwnd);
         }
         return 0;
     }
