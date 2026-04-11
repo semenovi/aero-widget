@@ -11,6 +11,7 @@
 #include <pdhmsg.h>
 #include <wininet.h>
 #include <shellapi.h>
+#include <tlhelp32.h>
 #include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -176,6 +177,52 @@ static PDH_HCOUNTER g_pdhDiskCtrs[MAX_DISKS]    = {};
 static PDH_HCOUNTER g_pdhDiskByteCtrs[MAX_DISKS] = {};
 static D2D1_RECT_F  g_diskChartRect = {};
 
+// -----------------------------------------------------------------------
+// Per-process top lists
+// -----------------------------------------------------------------------
+struct ProcEntry {
+    wchar_t name[64];
+    float   pct;        // 0..100
+    wchar_t absStr[32]; // formatted absolute value
+};
+
+static const int MAX_PROC_SHOW = 32;
+
+static ProcEntry g_procCpu[MAX_PROC_SHOW];
+static ProcEntry g_procGpu[MAX_PROC_SHOW];
+static ProcEntry g_procRam[MAX_PROC_SHOW];
+static ProcEntry g_procDisk[MAX_PROC_SHOW];
+static int       g_procCpuCount  = 0;
+static int       g_procGpuCount  = 0;
+static int       g_procRamCount  = 0;
+static int       g_procDiskCount = 0;
+
+// Display copies (flushed every FlushDisplayValues tick)
+static ProcEntry g_dispProcCpu[MAX_PROC_SHOW];
+static ProcEntry g_dispProcGpu[MAX_PROC_SHOW];
+static ProcEntry g_dispProcRam[MAX_PROC_SHOW];
+static ProcEntry g_dispProcDisk[MAX_PROC_SHOW];
+static int       g_dispProcCpuCount  = 0;
+static int       g_dispProcGpuCount  = 0;
+static int       g_dispProcRamCount  = 0;
+static int       g_dispProcDiskCount = 0;
+
+// Toggle: false = percent, true = absolute
+static bool g_procAbsMode[NUM_CHARTS] = {};
+
+// Click rects for process lists (local window coordinates)
+static D2D1_RECT_F g_procListRects[NUM_CHARTS] = {};
+
+// Second vertical divider (between charts and process lists)
+static float g_dividerX2    = 0.f;
+static bool  g_draggingDiv2 = false;
+static float g_cfgDividerX2 = -1.f;
+
+// PDH process counters (added to g_pdhQuery in WM_CREATE)
+static PDH_HCOUNTER g_pdhProcCpuCtr  = NULL;
+static PDH_HCOUNTER g_pdhProcRamCtr  = NULL;
+static PDH_HCOUNTER g_pdhProcDiskCtr = NULL;
+
 static void PushChartValue(Chart& c, double v)
 {
     c.values[c.head] = v;
@@ -183,6 +230,8 @@ static void PushChartValue(Chart& c, double v)
     if (c.count < CHART_SAMPLES) c.count++;
     c.current = v;
 }
+
+static void SampleProcesses(); // forward declaration
 
 static void FlushDisplayValues()
 {
@@ -210,6 +259,17 @@ static void FlushDisplayValues()
         g_diskCharts[i].displayCurrent = g_diskCharts[i].current;
         wcscpy_s(g_diskCharts[i].displayAbsStr, g_diskCharts[i].absStr);
     }
+
+    // Sample and flush process lists at the same rate as chart labels
+    SampleProcesses();
+    g_dispProcCpuCount  = g_procCpuCount;
+    g_dispProcGpuCount  = g_procGpuCount;
+    g_dispProcRamCount  = g_procRamCount;
+    g_dispProcDiskCount = g_procDiskCount;
+    if (g_procCpuCount  > 0) memcpy(g_dispProcCpu,  g_procCpu,  g_procCpuCount  * sizeof(ProcEntry));
+    if (g_procGpuCount  > 0) memcpy(g_dispProcGpu,  g_procGpu,  g_procGpuCount  * sizeof(ProcEntry));
+    if (g_procRamCount  > 0) memcpy(g_dispProcRam,  g_procRam,  g_procRamCount  * sizeof(ProcEntry));
+    if (g_procDiskCount > 0) memcpy(g_dispProcDisk, g_procDisk, g_procDiskCount * sizeof(ProcEntry));
 }
 
 // Draw text with character-level ellipsis trimming when it overflows rect width.
@@ -325,6 +385,92 @@ static void DrawChart(ID2D1RenderTarget* rt, const Chart& c,
 
             rt->DrawLine({ x0, y0 }, { x1, y1 }, pBrush, 0.75f);
         }
+    }
+
+    pBrush->Release();
+}
+
+// Draw a process list panel: title, separator line, then entries (name left, value right).
+// maxEntries is computed by the caller from tile height.
+static void DrawProcessList(ID2D1RenderTarget* rt,
+                             const wchar_t* title,
+                             const ProcEntry* entries, int count,
+                             D2D1_RECT_F area,
+                             bool absMode,
+                             int maxEntries)
+{
+    if (!g_pChartFmtL || !g_pChartFmtR) return;
+
+    ID2D1SolidColorBrush* pBrush = nullptr;
+    if (FAILED(rt->CreateSolidColorBrush(D2D1::ColorF(0.f, 0.f, 0.f, 1.f), &pBrush))) return;
+
+    const float margin = 8.f;
+    const float lineH  = g_fontSize * 1.4f;
+    float y = area.top;
+
+    // Title
+    if (y + lineH <= area.bottom)
+    {
+        D2D1_RECT_F titleRect = { area.left + margin, y, area.right - margin, y + lineH };
+        DrawTextEllipsis(rt, title, (UINT32)wcslen(title), g_pChartFmtL, titleRect, pBrush);
+        y += lineH;
+    }
+
+    // Separator line under title (same style as dividers: 0.75 px stroke)
+    if (y < area.bottom)
+    {
+        rt->DrawLine(
+            D2D1::Point2F(area.left + margin, y),
+            D2D1::Point2F(area.right - margin, y),
+            pBrush, 0.75f);
+        y += 2.f;
+    }
+
+    // Process entries
+    int shown = 0;
+    for (int i = 0; i < count && shown < maxEntries; ++i)
+    {
+        if (y + lineH > area.bottom) break;
+
+        wchar_t pctStr[32];
+        swprintf_s(pctStr, L"%.1f%%", entries[i].pct);
+        const wchar_t* valStr = absMode ? entries[i].absStr : pctStr;
+        UINT32 valLen = (UINT32)wcslen(valStr);
+
+        // Measure value width for right alignment
+        float valW = 0.f;
+        if (g_pDWFactory && valLen > 0)
+        {
+            float areaW = area.right - area.left - 2.f * margin;
+            IDWriteTextLayout* vl = nullptr;
+            if (SUCCEEDED(g_pDWFactory->CreateTextLayout(valStr, valLen,
+                    g_pChartFmtR, areaW, lineH, &vl)))
+            {
+                DWRITE_TEXT_METRICS tm = {};
+                vl->GetMetrics(&tm);
+                valW = tm.widthIncludingTrailingWhitespace;
+                if (valW > areaW) valW = areaW;
+                vl->Release();
+            }
+        }
+
+        // Draw name (left-aligned, clipped to not overlap value)
+        const float gap = 4.f;
+        float nameMaxW = (area.right - margin) - (area.left + margin) - valW - gap;
+        if (nameMaxW > 0.f)
+        {
+            D2D1_RECT_F nameRect = { area.left + margin, y,
+                                     area.left + margin + nameMaxW, y + lineH };
+            DrawTextEllipsis(rt, entries[i].name, (UINT32)wcslen(entries[i].name),
+                             g_pChartFmtL, nameRect, pBrush);
+        }
+
+        // Draw value (right-aligned)
+        D2D1_RECT_F valRect = { area.left + margin, y, area.right - margin, y + lineH };
+        rt->DrawText(valStr, valLen, g_pChartFmtR, valRect, pBrush);
+
+        y += lineH;
+        ++shown;
     }
 
     pBrush->Release();
@@ -480,12 +626,14 @@ static void SaveWindowState(HWND hwnd)
         "    \"win_h\": %d,\n"
         "    \"divider_x\": %.2f,\n"
         "    \"divider_y\": %.2f,\n"
+        "    \"divider_x2\": %.2f,\n"
         "    \"cpu_mode\": %d,\n"
         "    \"gpu_mode\": %d,\n"
         "    \"disk_mode\": %d\n"
         "}\n",
         escaped, monL, monT, relX, relY, winW, winH,
-        (double)g_dividerX, (double)g_dividerY, g_cpuMode, g_gpuMode, g_diskMode);
+        (double)g_dividerX, (double)g_dividerY, (double)g_dividerX2,
+        g_cpuMode, g_gpuMode, g_diskMode);
     fclose(f);
 }
 
@@ -596,6 +744,8 @@ static void LoadConfig()
         g_cfgDividerX = (float)dv;
     if (JsonDouble(buf, "divider_y", &dv) && dv > 0.0)
         g_cfgDividerY = (float)dv;
+    if (JsonDouble(buf, "divider_x2", &dv) && dv > 0.0)
+        g_cfgDividerX2 = (float)dv;
 
     int habrMin = 0;
     if (JsonInt(buf, "habr_refresh_minutes", &habrMin) && habrMin > 0)
@@ -1631,6 +1781,296 @@ static void SampleMetrics()
 }
 
 // -----------------------------------------------------------------------
+// Per-process sampling helpers
+// -----------------------------------------------------------------------
+
+// Strip "#N" PDH instance suffix and ".exe" extension for clean display name.
+static void NormalizeProcessName(const wchar_t* src, wchar_t* dst, int dstLen)
+{
+    wcsncpy_s(dst, dstLen, src, _TRUNCATE);
+    wchar_t* hash = wcsrchr(dst, L'#');
+    if (hash)
+    {
+        bool allDigits = true;
+        for (wchar_t* p = hash + 1; *p; ++p)
+            if (!iswdigit(*p)) { allDigits = false; break; }
+        if (allDigits) *hash = L'\0';
+    }
+    int n = (int)wcslen(dst);
+    if (n >= 4 && _wcsicmp(dst + n - 4, L".exe") == 0)
+        dst[n - 4] = L'\0';
+}
+
+// Get process exe name (without extension) from PID via kernel query.
+static void PidToName(DWORD pid, wchar_t* dst, int dstLen)
+{
+    dst[0] = L'\0';
+    HANDLE h = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pid);
+    if (!h) return;
+    wchar_t buf[MAX_PATH] = {};
+    DWORD sz = MAX_PATH;
+    if (QueryFullProcessImageNameW(h, 0, buf, &sz) && sz > 0)
+    {
+        wchar_t* last = wcsrchr(buf, L'\\');
+        const wchar_t* nm = last ? last + 1 : buf;
+        wcsncpy_s(dst, dstLen, nm, _TRUNCATE);
+        int n = (int)wcslen(dst);
+        if (n >= 4 && _wcsicmp(dst + n - 4, L".exe") == 0)
+            dst[n - 4] = L'\0';
+    }
+    CloseHandle(h);
+}
+
+struct TempProc {
+    wchar_t name[64];
+    double  pct;
+    double  absVal;
+};
+
+static int CompareTempProcDesc(const void* a, const void* b)
+{
+    double pa = ((const TempProc*)a)->pct;
+    double pb = ((const TempProc*)b)->pct;
+    return (pb > pa) ? 1 : (pb < pa) ? -1 : 0;
+}
+
+// Find or insert by name in temps array; returns index, or -1 if full.
+static int TempFindOrAdd(TempProc* temps, int& count, int maxCount, const wchar_t* name)
+{
+    for (int j = 0; j < count; ++j)
+        if (wcscmp(temps[j].name, name) == 0) return j;
+    if (count >= maxCount) return -1;
+    wcscpy_s(temps[count].name, name);
+    temps[count].pct    = 0.0;
+    temps[count].absVal = 0.0;
+    return count++;
+}
+
+static void SampleProcesses()
+{
+    static TempProc temps[1024];
+
+    // ---- CPU processes (\\Process(*)\\% Processor Time) ----
+    if (g_pdhProcCpuCtr)
+    {
+        DWORD sz = 0, cnt = 0;
+        PdhGetFormattedCounterArrayW(g_pdhProcCpuCtr, PDH_FMT_DOUBLE, &sz, &cnt, nullptr);
+        if (sz > 0)
+        {
+            auto* items = (PDH_FMT_COUNTERVALUE_ITEM_W*)malloc(sz);
+            if (items)
+            {
+                int nT = 0;
+                if (PdhGetFormattedCounterArrayW(g_pdhProcCpuCtr, PDH_FMT_DOUBLE,
+                        &sz, &cnt, items) == ERROR_SUCCESS)
+                {
+                    for (DWORD i = 0; i < cnt; ++i)
+                    {
+                        if (items[i].FmtValue.CStatus != PDH_CSTATUS_VALID_DATA) continue;
+                        double v = items[i].FmtValue.doubleValue;
+                        if (v <= 0.0) continue;
+                        const wchar_t* nm = items[i].szName;
+                        if (wcscmp(nm, L"_Total") == 0 || wcscmp(nm, L"Idle") == 0) continue;
+                        wchar_t clean[64];
+                        NormalizeProcessName(nm, clean, 64);
+                        int idx = TempFindOrAdd(temps, nT, 1024, clean);
+                        if (idx >= 0) { temps[idx].pct += v; temps[idx].absVal += v; }
+                    }
+                }
+                free(items);
+
+                double norm = (g_logicalCoreCount > 0) ? (double)g_logicalCoreCount : 1.0;
+                for (int j = 0; j < nT; ++j) { temps[j].pct /= norm; temps[j].absVal /= norm; }
+                qsort(temps, nT, sizeof(TempProc), CompareTempProcDesc);
+
+                int n = min(nT, MAX_PROC_SHOW);
+                g_procCpuCount = n;
+                for (int j = 0; j < n; ++j)
+                {
+                    wcscpy_s(g_procCpu[j].name, temps[j].name);
+                    g_procCpu[j].pct = (float)min(temps[j].pct, 100.0 * norm);
+                    int ms = (int)(temps[j].pct / 100.0 * 1000.0 + 0.5);
+                    swprintf_s(g_procCpu[j].absStr, L"%d ms/s", ms);
+                }
+            }
+        }
+    }
+
+    // ---- GPU processes (parse PIDs from GPU engine instance names) ----
+    if (g_pdhGpuCtr)
+    {
+        DWORD sz = 0, cnt = 0;
+        PdhGetFormattedCounterArrayW(g_pdhGpuCtr, PDH_FMT_DOUBLE, &sz, &cnt, nullptr);
+        if (sz > 0)
+        {
+            auto* items = (PDH_FMT_COUNTERVALUE_ITEM_W*)malloc(sz);
+            if (items)
+            {
+                int nT = 0;
+                if (PdhGetFormattedCounterArrayW(g_pdhGpuCtr, PDH_FMT_DOUBLE,
+                        &sz, &cnt, items) == ERROR_SUCCESS)
+                {
+                    for (DWORD i = 0; i < cnt; ++i)
+                    {
+                        if (items[i].FmtValue.CStatus != PDH_CSTATUS_VALID_DATA) continue;
+                        double v = items[i].FmtValue.doubleValue;
+                        if (v <= 0.0) continue;
+                        const wchar_t* nm = items[i].szName;
+                        // Instance format: "pid_NNNN_luid_..."
+                        DWORD pid = 0;
+                        if (wcsncmp(nm, L"pid_", 4) == 0) pid = (DWORD)_wtoi(nm + 4);
+                        if (pid == 0) continue;
+                        wchar_t procName[64] = {};
+                        PidToName(pid, procName, 64);
+                        if (!procName[0]) swprintf_s(procName, L"PID %u", pid);
+                        int idx = TempFindOrAdd(temps, nT, 1024, procName);
+                        if (idx >= 0) temps[idx].pct += v;
+                    }
+                }
+                free(items);
+
+                qsort(temps, nT, sizeof(TempProc), CompareTempProcDesc);
+                int n = min(nT, MAX_PROC_SHOW);
+                g_procGpuCount = n;
+                for (int j = 0; j < n; ++j)
+                {
+                    wcscpy_s(g_procGpu[j].name, temps[j].name);
+                    double pct = min(temps[j].pct, 100.0);
+                    g_procGpu[j].pct = (float)pct;
+                    swprintf_s(g_procGpu[j].absStr, L"%.1f%%", pct);
+                }
+            }
+        }
+    }
+
+    // ---- RAM processes (\\Process(*)\\Working Set) ----
+    if (g_pdhProcRamCtr)
+    {
+        DWORD sz = 0, cnt = 0;
+        PdhGetFormattedCounterArrayW(g_pdhProcRamCtr, PDH_FMT_LARGE, &sz, &cnt, nullptr);
+        if (sz > 0)
+        {
+            auto* items = (PDH_FMT_COUNTERVALUE_ITEM_W*)malloc(sz);
+            if (items)
+            {
+                MEMORYSTATUSEX ms = { sizeof(ms) };
+                GlobalMemoryStatusEx(&ms);
+                double totalBytes = (ms.ullTotalPhys > 0) ? (double)ms.ullTotalPhys : 1.0;
+
+                int nT = 0;
+                if (PdhGetFormattedCounterArrayW(g_pdhProcRamCtr, PDH_FMT_LARGE,
+                        &sz, &cnt, items) == ERROR_SUCCESS)
+                {
+                    for (DWORD i = 0; i < cnt; ++i)
+                    {
+                        if (items[i].FmtValue.CStatus != PDH_CSTATUS_VALID_DATA) continue;
+                        double bytes = (double)items[i].FmtValue.largeValue;
+                        if (bytes <= 0.0) continue;
+                        const wchar_t* nm = items[i].szName;
+                        if (wcscmp(nm, L"_Total") == 0 || wcscmp(nm, L"Idle") == 0) continue;
+                        wchar_t clean[64];
+                        NormalizeProcessName(nm, clean, 64);
+                        int idx = TempFindOrAdd(temps, nT, 1024, clean);
+                        if (idx >= 0)
+                        {
+                            temps[idx].pct    += bytes / totalBytes * 100.0;
+                            temps[idx].absVal += bytes;
+                        }
+                    }
+                }
+                free(items);
+
+                qsort(temps, nT, sizeof(TempProc), CompareTempProcDesc);
+                int n = min(nT, MAX_PROC_SHOW);
+                g_procRamCount = n;
+                for (int j = 0; j < n; ++j)
+                {
+                    wcscpy_s(g_procRam[j].name, temps[j].name);
+                    g_procRam[j].pct = (float)min(temps[j].pct, 100.0);
+                    double mb = temps[j].absVal / (1024.0 * 1024.0);
+                    if (mb >= 1024.0)
+                        swprintf_s(g_procRam[j].absStr, L"%.1f GB", mb / 1024.0);
+                    else
+                        swprintf_s(g_procRam[j].absStr, L"%.0f MB", mb);
+                }
+            }
+        }
+    }
+
+    // ---- Disk processes (\\Process(*)\\IO Data Bytes/sec) ----
+    if (g_pdhProcDiskCtr)
+    {
+        DWORD sz = 0, cnt = 0;
+        PdhGetFormattedCounterArrayW(g_pdhProcDiskCtr, PDH_FMT_DOUBLE, &sz, &cnt, nullptr);
+        if (sz > 0)
+        {
+            auto* items = (PDH_FMT_COUNTERVALUE_ITEM_W*)malloc(sz);
+            if (items)
+            {
+                int nT = 0;
+                if (PdhGetFormattedCounterArrayW(g_pdhProcDiskCtr, PDH_FMT_DOUBLE,
+                        &sz, &cnt, items) == ERROR_SUCCESS)
+                {
+                    // Get actual disk utilisation (% Disk Time, 0-100).
+                    double diskPct = 0.0;
+                    if (g_pdhDiskCtr)
+                    {
+                        PDH_FMT_COUNTERVALUE val;
+                        if (PdhGetFormattedCounterValue(g_pdhDiskCtr, PDH_FMT_DOUBLE,
+                                nullptr, &val) == ERROR_SUCCESS &&
+                            val.CStatus == PDH_CSTATUS_VALID_DATA)
+                            diskPct = max(0.0, min(val.doubleValue, 100.0));
+                    }
+
+                    // Total process I/O — used to split diskPct proportionally.
+                    double totalBps = 0.0;
+                    for (DWORD i = 0; i < cnt; ++i)
+                    {
+                        if (items[i].FmtValue.CStatus != PDH_CSTATUS_VALID_DATA) continue;
+                        if (wcscmp(items[i].szName, L"_Total") == 0)
+                        {
+                            totalBps = items[i].FmtValue.doubleValue;
+                            break;
+                        }
+                    }
+                    if (totalBps <= 0.0) totalBps = 1.0;
+
+                    for (DWORD i = 0; i < cnt; ++i)
+                    {
+                        if (items[i].FmtValue.CStatus != PDH_CSTATUS_VALID_DATA) continue;
+                        double bps = items[i].FmtValue.doubleValue;
+                        if (bps <= 0.0) continue;
+                        const wchar_t* nm = items[i].szName;
+                        if (wcscmp(nm, L"_Total") == 0 || wcscmp(nm, L"Idle") == 0) continue;
+                        wchar_t clean[64];
+                        NormalizeProcessName(nm, clean, 64);
+                        int idx = TempFindOrAdd(temps, nT, 1024, clean);
+                        if (idx >= 0)
+                        {
+                            // Share of actual disk load: process fraction × real disk %.
+                            temps[idx].pct    += bps / totalBps * diskPct;
+                            temps[idx].absVal += bps;
+                        }
+                    }
+                }
+                free(items);
+
+                qsort(temps, nT, sizeof(TempProc), CompareTempProcDesc);
+                int n = min(nT, MAX_PROC_SHOW);
+                g_procDiskCount = n;
+                for (int j = 0; j < n; ++j)
+                {
+                    wcscpy_s(g_procDisk[j].name, temps[j].name);
+                    g_procDisk[j].pct = (float)min(temps[j].pct, 100.0);
+                    double mbs = temps[j].absVal / (1024.0 * 1024.0);
+                    swprintf_s(g_procDisk[j].absStr, L"%.1f MB/s", mbs);
+                }
+            }
+        }
+    }
+}
+
+// -----------------------------------------------------------------------
 // Layered window update
 // -----------------------------------------------------------------------
 static void UpdateLayeredContent(HWND hwnd)
@@ -1695,7 +2135,7 @@ static void UpdateLayeredContent(HWND hwnd)
             DrawHabrPanel(g_pDCRT, habrArea, g_habrHover);
         }
 
-        // --- Vertical divider line ---
+        // --- Vertical divider line (left panel | charts) ---
         {
             ID2D1SolidColorBrush* pDiv = nullptr;
             if (SUCCEEDED(g_pDCRT->CreateSolidColorBrush(D2D1::ColorF(0.f, 0.f, 0.f, 1.f), &pDiv)))
@@ -1708,13 +2148,26 @@ static void UpdateLayeredContent(HWND hwnd)
             }
         }
 
-        // --- Charts (right of divider) ---
+        // --- Vertical divider line (charts | process lists) ---
+        {
+            ID2D1SolidColorBrush* pDiv2 = nullptr;
+            if (SUCCEEDED(g_pDCRT->CreateSolidColorBrush(D2D1::ColorF(0.f, 0.f, 0.f, 1.f), &pDiv2)))
+            {
+                g_pDCRT->DrawLine(
+                    D2D1::Point2F(g_dividerX2, VEDGE),
+                    D2D1::Point2F(g_dividerX2, (float)h - VEDGE),
+                    pDiv2, 0.75f);
+                pDiv2->Release();
+            }
+        }
+
+        // --- Charts (between the two right-side dividers) ---
         {
             const float chartLeft = g_dividerX + PAD;
-            const float colW = (float)w - chartLeft - PAD;
+            const float colW = g_dividerX2 - PAD - chartLeft;
             const float rowH = ((float)h - 2.f * VEDGE - (NUM_CHARTS - 1) * PAD) / NUM_CHARTS;
 
-            // Store chart rects for click detection
+            // Store chart rects for click detection (chart portion only)
             g_cpuChartRect  = { chartLeft, VEDGE,                       chartLeft + colW, VEDGE + rowH };
             g_gpuChartRect  = { chartLeft, VEDGE + (rowH + PAD),        chartLeft + colW, VEDGE + (rowH + PAD) + rowH };
             g_diskChartRect = { chartLeft, VEDGE + 3.f * (rowH + PAD),  chartLeft + colW, VEDGE + 3.f * (rowH + PAD) + rowH };
@@ -1727,11 +2180,8 @@ static void UpdateLayeredContent(HWND hwnd)
 
                 if (i == 0 && g_cpuMode != 0)
                 {
-                    // Expanded per-core view: CPU name header above, then N mini charts.
                     const float titleH = g_fontSize * 1.4f;
                     const float margin = 8.f;
-
-                    // Draw shared CPU name above all mini charts
                     {
                         ID2D1SolidColorBrush* pBrush = nullptr;
                         if (SUCCEEDED(g_pDCRT->CreateSolidColorBrush(
@@ -1744,7 +2194,6 @@ static void UpdateLayeredContent(HWND hwnd)
                             pBrush->Release();
                         }
                     }
-
                     const Chart* cores = (g_cpuMode == 1) ? g_logicalCharts  : g_physicalCharts;
                     int coreCount      = (g_cpuMode == 1) ? g_logicalCoreCount : g_physicalCoreCount;
                     if (coreCount < 1) coreCount = 1;
@@ -1759,20 +2208,14 @@ static void UpdateLayeredContent(HWND hwnd)
                 }
                 else if (i == 1 && g_gpuMode != 0)
                 {
-                    if (g_gpuMode == 1) // VRAM %
-                    {
+                    if (g_gpuMode == 1)
                         DrawChart(g_pDCRT, g_gpuVramChart, area, g_pChartFmtL, g_pChartFmtR);
-                    }
-                    else if (g_gpuMode == 2) // Temperature
-                    {
+                    else if (g_gpuMode == 2)
                         DrawChart(g_pDCRT, g_gpuTempChart, area, g_pChartFmtL, g_pChartFmtR);
-                    }
-                    else // g_gpuMode == 3: core + VRAM side by side
+                    else
                     {
                         const float titleH = g_fontSize * 1.4f;
                         const float margin = 8.f;
-
-                        // Draw shared GPU name above both charts
                         {
                             ID2D1SolidColorBrush* pBrush = nullptr;
                             if (SUCCEEDED(g_pDCRT->CreateSolidColorBrush(
@@ -1785,14 +2228,11 @@ static void UpdateLayeredContent(HWND hwnd)
                                 pBrush->Release();
                             }
                         }
-
                         float halfW  = colW / 2.f;
                         float chartY = y + titleH;
-                        D2D1_RECT_F leftArea  = { x,          chartY, x + halfW, y + rowH };
-                        D2D1_RECT_F rightArea = { x + halfW,  chartY, x + colW,  y + rowH };
                         int miniSamples = max(2, CHART_SAMPLES / 2);
-                        DrawChart(g_pDCRT, g_charts[1],    leftArea,  nullptr, g_pChartFmtR, miniSamples);
-                        DrawChart(g_pDCRT, g_gpuVramChart, rightArea, nullptr, g_pChartFmtR, miniSamples);
+                        DrawChart(g_pDCRT, g_charts[1],    { x,         chartY, x + halfW, y + rowH }, nullptr, g_pChartFmtR, miniSamples);
+                        DrawChart(g_pDCRT, g_gpuVramChart, { x + halfW, chartY, x + colW,  y + rowH }, nullptr, g_pChartFmtR, miniSamples);
                     }
                 }
                 else if (i == 3 && g_diskMode > 0)
@@ -1805,6 +2245,39 @@ static void UpdateLayeredContent(HWND hwnd)
                 {
                     DrawChart(g_pDCRT, g_charts[i], area, g_pChartFmtL, g_pChartFmtR);
                 }
+            }
+        }
+
+        // --- Process lists (right of second divider) ---
+        {
+            static const wchar_t* procTitles[NUM_CHARTS] = { L"CPU", L"GPU", L"RAM", L"Disk" };
+            const ProcEntry* dataArr[NUM_CHARTS] = {
+                g_dispProcCpu, g_dispProcGpu, g_dispProcRam, g_dispProcDisk
+            };
+            int dataCnt[NUM_CHARTS] = {
+                g_dispProcCpuCount, g_dispProcGpuCount, g_dispProcRamCount, g_dispProcDiskCount
+            };
+
+            const float listLeft = g_dividerX2 + PAD;
+            const float listW    = (float)w - listLeft - PAD;
+            const float rowH     = ((float)h - 2.f * VEDGE - (NUM_CHARTS - 1) * PAD) / NUM_CHARTS;
+            const float lineH    = g_fontSize * 1.4f;
+
+            for (int i = 0; i < NUM_CHARTS; ++i)
+            {
+                float y = VEDGE + i * (rowH + PAD);
+                D2D1_RECT_F listArea = { listLeft, y, listLeft + listW, y + rowH };
+                g_procListRects[i]   = listArea;
+
+                // Compute how many entries fit: subtract title line + separator (lineH + 2px)
+                int maxEntries = (int)((rowH - lineH - 2.f) / lineH);
+                if (maxEntries < 0) maxEntries = 0;
+
+                DrawProcessList(g_pDCRT, procTitles[i],
+                                dataArr[i], dataCnt[i],
+                                listArea,
+                                g_procAbsMode[i],
+                                maxEntries);
             }
         }
 
@@ -1942,6 +2415,16 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
             EnumerateDisks();
             // Clamp restored disk mode to valid range
             if (g_diskMode > g_diskCount) g_diskMode = 0;
+            // Per-process counters for the process lists
+            PdhAddEnglishCounterW(g_pdhQuery,
+                L"\\Process(*)\\% Processor Time",
+                0, &g_pdhProcCpuCtr);
+            PdhAddEnglishCounterW(g_pdhQuery,
+                L"\\Process(*)\\Working Set",
+                0, &g_pdhProcRamCtr);
+            PdhAddEnglishCounterW(g_pdhQuery,
+                L"\\Process(*)\\IO Data Bytes/sec",
+                0, &g_pdhProcDiskCtr);
             PdhCollectQueryData(g_pdhQuery);
         }
 
@@ -2019,6 +2502,11 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
                 g_dividerY = max(60.f, min(g_cfgDividerY, (float)h - 60.f));
             else
                 g_dividerY = (float)h * 0.55f;
+
+            if (g_cfgDividerX2 > 0.f)
+                g_dividerX2 = max(g_dividerX + 120.f, min(g_cfgDividerX2, (float)w - 80.f));
+            else
+                g_dividerX2 = g_dividerX + ((float)w - g_dividerX) * 0.60f;
         }
 
         // Config already loaded in WinMain; kick weather and Habr fetches
@@ -2083,8 +2571,13 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
         int my = pt.y - rc.top;
         int wh = rc.bottom - rc.top;
 
-        // Vertical divider hit → client (so WM_LBUTTONDOWN fires)
+        // Vertical divider 1 hit → client (so WM_LBUTTONDOWN fires)
         if (abs(mx - (int)g_dividerX) <= DIV_HIT &&
+            my >= (int)VEDGE && my <= wh - (int)VEDGE)
+            return HTCLIENT;
+
+        // Vertical divider 2 hit (charts | process lists)
+        if (abs(mx - (int)g_dividerX2) <= DIV_HIT &&
             my >= (int)VEDGE && my <= wh - (int)VEDGE)
             return HTCLIENT;
 
@@ -2098,7 +2591,7 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
             my > (int)g_dividerY + DIV_HIT && my < wh - (int)VEDGE)
             return HTCLIENT;
 
-        // CPU chart row (right panel, top row) → client so click fires
+        // CPU chart row → client so click fires
         if ((float)mx >= g_cpuChartRect.left && (float)mx <= g_cpuChartRect.right &&
             (float)my >= g_cpuChartRect.top  && (float)my <= g_cpuChartRect.bottom)
             return HTCLIENT;
@@ -2112,6 +2605,12 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
         if ((float)mx >= g_diskChartRect.left && (float)mx <= g_diskChartRect.right &&
             (float)my >= g_diskChartRect.top  && (float)my <= g_diskChartRect.bottom)
             return HTCLIENT;
+
+        // Process list areas
+        for (int i = 0; i < NUM_CHARTS; ++i)
+            if ((float)mx >= g_procListRects[i].left  && (float)mx <= g_procListRects[i].right &&
+                (float)my >= g_procListRects[i].top   && (float)my <= g_procListRects[i].bottom)
+                return HTCLIENT;
 
         return HTCAPTION;
     }
@@ -2127,8 +2626,9 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
             int my = pt.y - rc.top;
             int wh = rc.bottom - rc.top;
 
-            // Vertical divider
-            if (abs(mx - (int)g_dividerX) <= DIV_HIT &&
+            // Vertical dividers
+            if ((abs(mx - (int)g_dividerX) <= DIV_HIT ||
+                 abs(mx - (int)g_dividerX2) <= DIV_HIT) &&
                 my >= (int)VEDGE && my <= wh - (int)VEDGE)
             {
                 SetCursor(LoadCursorW(NULL, IDC_SIZEWE));
@@ -2159,6 +2659,11 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
         if (abs(mx - (int)g_dividerX) <= DIV_HIT)
         {
             g_draggingDiv = true;
+            SetCapture(hwnd);
+        }
+        else if (abs(mx - (int)g_dividerX2) <= DIV_HIT)
+        {
+            g_draggingDiv2 = true;
             SetCapture(hwnd);
         }
         else if (mx >= 0 && mx < (int)g_dividerX - DIV_HIT &&
@@ -2196,6 +2701,20 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
                 UpdateLayeredContent(hwnd);
             }
         }
+        else
+        {
+            // Process list click: toggle abs/pct display for the clicked tile
+            for (int i = 0; i < NUM_CHARTS; ++i)
+            {
+                if ((float)mx >= g_procListRects[i].left  && (float)mx <= g_procListRects[i].right &&
+                    (float)my >= g_procListRects[i].top   && (float)my <= g_procListRects[i].bottom)
+                {
+                    g_procAbsMode[i] = !g_procAbsMode[i];
+                    UpdateLayeredContent(hwnd);
+                    break;
+                }
+            }
+        }
         return 0;
     }
 
@@ -2208,7 +2727,13 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
         if (g_draggingDiv)
         {
             int w = rc.right - rc.left;
-            g_dividerX = max(80.f, min((float)mx, (float)w - 80.f));
+            g_dividerX = max(80.f, min((float)mx, g_dividerX2 - 120.f));
+            UpdateLayeredContent(hwnd);
+        }
+        else if (g_draggingDiv2)
+        {
+            int w = rc.right - rc.left;
+            g_dividerX2 = max(g_dividerX + 120.f, min((float)mx, (float)w - 80.f));
             UpdateLayeredContent(hwnd);
         }
         else if (g_draggingDivH)
@@ -2253,13 +2778,21 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
 
     case WM_LBUTTONUP:
     {
-        bool wasDivV = g_draggingDiv;
-        bool wasDivH = g_draggingDivH;
+        bool wasDivV  = g_draggingDiv;
+        bool wasDivV2 = g_draggingDiv2;
+        bool wasDivH  = g_draggingDivH;
 
         if (g_draggingDiv)
         {
             g_draggingDiv = false;
             ReleaseCapture();
+            SaveWindowState(hwnd);
+        }
+        else if (g_draggingDiv2)
+        {
+            g_draggingDiv2 = false;
+            ReleaseCapture();
+            SaveWindowState(hwnd);
         }
         else if (g_draggingDivH)
         {
@@ -2268,7 +2801,7 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
         }
 
         // Link click: only if no drag occurred and mouse is on a visible link
-        if (!wasDivV && !wasDivH &&
+        if (!wasDivV && !wasDivV2 && !wasDivH &&
             g_habrHover >= 0 && g_habrHover < g_habrVisible)
         {
             int idx = g_habrHover;
@@ -2297,8 +2830,9 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
             RECT rc; GetWindowRect(hwnd, &rc);
             int w = rc.right - rc.left;
             int h = rc.bottom - rc.top;
-            g_dividerX = max(80.f, min(g_dividerX, (float)w - 80.f));
-            g_dividerY = max(60.f, min(g_dividerY, (float)h - 60.f));
+            g_dividerX  = max(80.f,  min(g_dividerX,  (float)w - 80.f));
+            g_dividerY  = max(60.f,  min(g_dividerY,  (float)h - 60.f));
+            g_dividerX2 = max(g_dividerX + 120.f, min(g_dividerX2, (float)w - 80.f));
             UpdateLayeredContent(hwnd);
         }
         return 0;
