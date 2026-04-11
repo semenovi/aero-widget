@@ -136,6 +136,26 @@ static Chart  g_physicalCharts[MAX_CORES]    = {};
 static PDH_HCOUNTER g_pdhCoreCtr = NULL;
 static D2D1_RECT_F  g_cpuChartRect = {};  // CPU row rect (local coords), for click detection
 
+// -----------------------------------------------------------------------
+// GPU mode
+// -----------------------------------------------------------------------
+static int          g_gpuMode       = 0; // 0=core load, 1=VRAM %, 2=temp, 3=core+VRAM
+static Chart        g_gpuVramChart  = {};
+static Chart        g_gpuTempChart  = {};
+static PDH_HCOUNTER g_pdhGpuTempCtr = NULL;
+static D2D1_RECT_F  g_gpuChartRect  = {};
+
+// -----------------------------------------------------------------------
+// Per-disk state
+// -----------------------------------------------------------------------
+static const int    MAX_DISKS = 16;
+static int          g_diskMode  = 0; // 0=_Total, 1..N = disk index (1-based)
+static int          g_diskCount = 0;
+static Chart        g_diskCharts[MAX_DISKS]     = {};
+static PDH_HCOUNTER g_pdhDiskCtrs[MAX_DISKS]    = {};
+static PDH_HCOUNTER g_pdhDiskByteCtrs[MAX_DISKS] = {};
+static D2D1_RECT_F  g_diskChartRect = {};
+
 static void PushChartValue(Chart& c, double v)
 {
     c.values[c.head] = v;
@@ -160,6 +180,15 @@ static void FlushDisplayValues()
     {
         g_physicalCharts[i].displayCurrent = g_physicalCharts[i].current;
         wcscpy_s(g_physicalCharts[i].displayAbsStr, g_physicalCharts[i].absStr);
+    }
+    g_gpuVramChart.displayCurrent = g_gpuVramChart.current;
+    wcscpy_s(g_gpuVramChart.displayAbsStr, g_gpuVramChart.absStr);
+    g_gpuTempChart.displayCurrent = g_gpuTempChart.current;
+    wcscpy_s(g_gpuTempChart.displayAbsStr, g_gpuTempChart.absStr);
+    for (int i = 0; i < g_diskCount; ++i)
+    {
+        g_diskCharts[i].displayCurrent = g_diskCharts[i].current;
+        wcscpy_s(g_diskCharts[i].displayAbsStr, g_diskCharts[i].absStr);
     }
 }
 
@@ -431,10 +460,12 @@ static void SaveWindowState(HWND hwnd)
         "    \"win_h\": %d,\n"
         "    \"divider_x\": %.2f,\n"
         "    \"divider_y\": %.2f,\n"
-        "    \"cpu_mode\": %d\n"
+        "    \"cpu_mode\": %d,\n"
+        "    \"gpu_mode\": %d,\n"
+        "    \"disk_mode\": %d\n"
         "}\n",
         escaped, monL, monT, relX, relY, winW, winH,
-        (double)g_dividerX, (double)g_dividerY, g_cpuMode);
+        (double)g_dividerX, (double)g_dividerY, g_cpuMode, g_gpuMode, g_diskMode);
     fclose(f);
 }
 
@@ -553,6 +584,14 @@ static void LoadConfig()
     int cpuMode = 0;
     if (JsonInt(buf, "cpu_mode", &cpuMode) && cpuMode >= 0 && cpuMode <= 2)
         g_cpuMode = cpuMode;
+
+    int gpuMode = 0;
+    if (JsonInt(buf, "gpu_mode", &gpuMode) && gpuMode >= 0 && gpuMode <= 3)
+        g_gpuMode = gpuMode;
+
+    int diskMode = 0;
+    if (JsonInt(buf, "disk_mode", &diskMode) && diskMode >= 0)
+        g_diskMode = diskMode; // validated against g_diskCount after enumeration
 }
 
 // -----------------------------------------------------------------------
@@ -1167,6 +1206,89 @@ static void GetDiskName(wchar_t* buf, int len)
     }
 }
 
+// Enumerate physical disk PDH instances, set up per-disk counters and chart names.
+// Must be called after PdhOpenQuery and before PdhCollectQueryData.
+static void EnumerateDisks()
+{
+    g_diskCount = 0;
+
+    DWORD counterListSize = 0, instanceListSize = 0;
+    PDH_STATUS st = PdhEnumObjectItemsW(NULL, NULL, L"PhysicalDisk",
+        NULL, &counterListSize, NULL, &instanceListSize,
+        PERF_DETAIL_WIZARD, 0);
+    if ((st != PDH_MORE_DATA && st != ERROR_SUCCESS) || instanceListSize == 0) return;
+
+    wchar_t* counterList  = (wchar_t*)malloc(counterListSize  * sizeof(wchar_t));
+    wchar_t* instanceList = (wchar_t*)malloc(instanceListSize * sizeof(wchar_t));
+    if (!counterList || !instanceList) { free(counterList); free(instanceList); return; }
+
+    st = PdhEnumObjectItemsW(NULL, NULL, L"PhysicalDisk",
+        counterList, &counterListSize,
+        instanceList, &instanceListSize,
+        PERF_DETAIL_WIZARD, 0);
+
+    if (st == ERROR_SUCCESS)
+    {
+        const wchar_t* p = instanceList;
+        while (*p && g_diskCount < MAX_DISKS)
+        {
+            if (wcscmp(p, L"_Total") != 0)
+            {
+                int idx = g_diskCount;
+
+                // Default name: "Disk N"
+                swprintf_s(g_diskCharts[idx].name, L"Disk %d", idx);
+
+                // Try to get a pretty name from the storage device
+                int diskNum = _wtoi(p);
+                wchar_t drivePath[64];
+                swprintf_s(drivePath, L"\\\\.\\PhysicalDrive%d", diskNum);
+                HANDLE h = CreateFileW(drivePath, 0,
+                    FILE_SHARE_READ | FILE_SHARE_WRITE,
+                    nullptr, OPEN_EXISTING, 0, nullptr);
+                if (h != INVALID_HANDLE_VALUE)
+                {
+                    char raw[512] = {};
+                    STORAGE_PROPERTY_QUERY q = { StorageDeviceProperty, PropertyStandardQuery };
+                    DWORD ret = 0;
+                    if (DeviceIoControl(h, IOCTL_STORAGE_QUERY_PROPERTY,
+                            &q, sizeof(q), raw, sizeof(raw), &ret, nullptr))
+                    {
+                        auto* d = (STORAGE_DEVICE_DESCRIPTOR*)raw;
+                        if (d->ProductIdOffset && d->ProductIdOffset < (DWORD)sizeof(raw))
+                        {
+                            const char* prod = raw + d->ProductIdOffset;
+                            wchar_t prodW[256] = {};
+                            int n = MultiByteToWideChar(CP_ACP, 0, prod, -1, prodW, 256);
+                            if (n > 1)
+                            {
+                                for (int i = n - 2; i >= 0 && prodW[i] == L' '; --i)
+                                    prodW[i] = L'\0';
+                                if (prodW[0])
+                                    wcscpy_s(g_diskCharts[idx].name, prodW);
+                            }
+                        }
+                    }
+                    CloseHandle(h);
+                }
+
+                // Add PDH counters for this disk instance
+                wchar_t ctrPath[256];
+                swprintf_s(ctrPath, L"\\PhysicalDisk(%s)\\%% Disk Time", p);
+                PdhAddEnglishCounterW(g_pdhQuery, ctrPath, 0, &g_pdhDiskCtrs[idx]);
+                swprintf_s(ctrPath, L"\\PhysicalDisk(%s)\\Disk Bytes/sec", p);
+                PdhAddEnglishCounterW(g_pdhQuery, ctrPath, 0, &g_pdhDiskByteCtrs[idx]);
+
+                g_diskCount++;
+            }
+            p += wcslen(p) + 1;
+        }
+    }
+
+    free(counterList);
+    free(instanceList);
+}
+
 // -----------------------------------------------------------------------
 // Core topology detection
 // -----------------------------------------------------------------------
@@ -1310,6 +1432,7 @@ static void SampleMetrics()
 
     // GPU – PDH wildcard over all 3D engine instances
     {
+        // Core utilization
         double v = 0.0;
         if (g_pdhGpuCtr)
         {
@@ -1334,6 +1457,7 @@ static void SampleMetrics()
         }
         PushChartValue(g_charts[1], min(v / 100.0, 1.0));
 
+        // VRAM usage
         if (g_pdhGpuMemCtr && g_gpuTotalVram > 0)
         {
             DWORD sz2 = 0, cnt2 = 0;
@@ -1356,7 +1480,54 @@ static void SampleMetrics()
                     double usedGB  = (double)totalUsed      / (1024.0 * 1024.0 * 1024.0);
                     double totalGB = (double)g_gpuTotalVram / (1024.0 * 1024.0 * 1024.0);
                     swprintf_s(g_charts[1].absStr, L"%.1f / %.0f GB", usedGB, totalGB);
+
+                    // VRAM % chart
+                    double vramPct = min((double)totalUsed / (double)g_gpuTotalVram, 1.0);
+                    PushChartValue(g_gpuVramChart, max(0.0, vramPct));
+                    swprintf_s(g_gpuVramChart.absStr, L"%.1f / %.0f GB", usedGB, totalGB);
                 }
+            }
+        }
+        else
+        {
+            PushChartValue(g_gpuVramChart, 0.0);
+        }
+
+        // GPU temperature (best-effort via PDH; may not be available on all hardware)
+        {
+            double tempC  = 0.0;
+            bool   gotTemp = false;
+            if (g_pdhGpuTempCtr)
+            {
+                DWORD sz3 = 0, cnt3 = 0;
+                PdhGetFormattedCounterArrayW(g_pdhGpuTempCtr, PDH_FMT_DOUBLE,
+                                             &sz3, &cnt3, nullptr);
+                if (sz3 > 0)
+                {
+                    auto* items3 = (PDH_FMT_COUNTERVALUE_ITEM_W*)malloc(sz3);
+                    if (items3)
+                    {
+                        if (PdhGetFormattedCounterArrayW(g_pdhGpuTempCtr, PDH_FMT_DOUBLE,
+                                &sz3, &cnt3, items3) == ERROR_SUCCESS)
+                        {
+                            for (DWORD i = 0; i < cnt3; ++i)
+                                if (items3[i].FmtValue.CStatus == PDH_CSTATUS_VALID_DATA)
+                                { tempC = items3[i].FmtValue.doubleValue; gotTemp = true; break; }
+                        }
+                        free(items3);
+                    }
+                }
+            }
+            if (gotTemp)
+            {
+                // Normalize: treat 100°C as 100%
+                PushChartValue(g_gpuTempChart, max(0.0, min(tempC / 100.0, 1.0)));
+                swprintf_s(g_gpuTempChart.absStr, L"%.0f\u00B0C", tempC);
+            }
+            else
+            {
+                PushChartValue(g_gpuTempChart, 0.0);
+                wcscpy_s(g_gpuTempChart.absStr, L"N/A");
             }
         }
     }
@@ -1374,7 +1545,7 @@ static void SampleMetrics()
         }
     }
 
-    // Disk – PDH % Disk Time
+    // Disk – PDH % Disk Time (_Total + per-disk)
     {
         double v = 0.0;
         if (g_pdhDiskCtr)
@@ -1394,6 +1565,31 @@ static void SampleMetrics()
                     nullptr, &val) == ERROR_SUCCESS &&
                 val.CStatus == PDH_CSTATUS_VALID_DATA)
                 swprintf_s(g_charts[3].absStr, L"%.1f MB/s", val.doubleValue / (1024.0 * 1024.0));
+        }
+
+        // Per-disk sampling
+        for (int di = 0; di < g_diskCount; di++)
+        {
+            double dv = 0.0;
+            if (g_pdhDiskCtrs[di])
+            {
+                PDH_FMT_COUNTERVALUE val;
+                if (PdhGetFormattedCounterValue(g_pdhDiskCtrs[di], PDH_FMT_DOUBLE,
+                        nullptr, &val) == ERROR_SUCCESS &&
+                    val.CStatus == PDH_CSTATUS_VALID_DATA)
+                    dv = val.doubleValue / 100.0;
+            }
+            PushChartValue(g_diskCharts[di], max(0.0, min(dv, 1.0)));
+
+            if (g_pdhDiskByteCtrs[di])
+            {
+                PDH_FMT_COUNTERVALUE val;
+                if (PdhGetFormattedCounterValue(g_pdhDiskByteCtrs[di], PDH_FMT_DOUBLE,
+                        nullptr, &val) == ERROR_SUCCESS &&
+                    val.CStatus == PDH_CSTATUS_VALID_DATA)
+                    swprintf_s(g_diskCharts[di].absStr, L"%.1f MB/s",
+                        val.doubleValue / (1024.0 * 1024.0));
+            }
         }
     }
 
@@ -1484,8 +1680,10 @@ static void UpdateLayeredContent(HWND hwnd)
             const float colW = (float)w - chartLeft - PAD;
             const float rowH = ((float)h - 2.f * VEDGE - (NUM_CHARTS - 1) * PAD) / NUM_CHARTS;
 
-            // Store CPU row rect for click detection (always the top row)
-            g_cpuChartRect = { chartLeft, VEDGE, chartLeft + colW, VEDGE + rowH };
+            // Store chart rects for click detection
+            g_cpuChartRect  = { chartLeft, VEDGE,                       chartLeft + colW, VEDGE + rowH };
+            g_gpuChartRect  = { chartLeft, VEDGE + (rowH + PAD),        chartLeft + colW, VEDGE + (rowH + PAD) + rowH };
+            g_diskChartRect = { chartLeft, VEDGE + 3.f * (rowH + PAD),  chartLeft + colW, VEDGE + 3.f * (rowH + PAD) + rowH };
 
             for (int i = 0; i < NUM_CHARTS; ++i)
             {
@@ -1495,19 +1693,79 @@ static void UpdateLayeredContent(HWND hwnd)
 
                 if (i == 0 && g_cpuMode != 0)
                 {
-                    // Expanded per-core view: N mini charts side by side in one row.
-                    // Each mini chart shows samples proportional to its width so the
-                    // time-density matches the full-width chart.
-                    const Chart* cores   = (g_cpuMode == 1) ? g_logicalCharts  : g_physicalCharts;
-                    int coreCount        = (g_cpuMode == 1) ? g_logicalCoreCount : g_physicalCoreCount;
+                    // Expanded per-core view: CPU name header above, then N mini charts.
+                    const float titleH = g_fontSize * 1.4f;
+                    const float margin = 8.f;
+
+                    // Draw shared CPU name above all mini charts
+                    {
+                        ID2D1SolidColorBrush* pBrush = nullptr;
+                        if (SUCCEEDED(g_pDCRT->CreateSolidColorBrush(
+                                D2D1::ColorF(0.f, 0.f, 0.f, 1.f), &pBrush)))
+                        {
+                            D2D1_RECT_F titleRect = { x + margin, y, x + colW - margin, y + titleH };
+                            DrawTextEllipsis(g_pDCRT, g_charts[0].name,
+                                             (UINT32)wcslen(g_charts[0].name),
+                                             g_pChartFmtL, titleRect, pBrush);
+                            pBrush->Release();
+                        }
+                    }
+
+                    const Chart* cores = (g_cpuMode == 1) ? g_logicalCharts  : g_physicalCharts;
+                    int coreCount      = (g_cpuMode == 1) ? g_logicalCoreCount : g_physicalCoreCount;
                     if (coreCount < 1) coreCount = 1;
                     int miniSamples = max(2, CHART_SAMPLES / coreCount);
-                    float miniW = colW / (float)coreCount;
+                    float miniW  = colW / (float)coreCount;
+                    float chartY = y + titleH;
                     for (int c = 0; c < coreCount; c++)
                     {
-                        D2D1_RECT_F mini = { x + c * miniW, y, x + (c + 1) * miniW, y + rowH };
+                        D2D1_RECT_F mini = { x + c * miniW, chartY, x + (c + 1) * miniW, y + rowH };
                         DrawChart(g_pDCRT, cores[c], mini, g_pChartFmtL, g_pChartFmtR, miniSamples);
                     }
+                }
+                else if (i == 1 && g_gpuMode != 0)
+                {
+                    if (g_gpuMode == 1) // VRAM %
+                    {
+                        DrawChart(g_pDCRT, g_gpuVramChart, area, g_pChartFmtL, g_pChartFmtR);
+                    }
+                    else if (g_gpuMode == 2) // Temperature
+                    {
+                        DrawChart(g_pDCRT, g_gpuTempChart, area, g_pChartFmtL, g_pChartFmtR);
+                    }
+                    else // g_gpuMode == 3: core + VRAM side by side
+                    {
+                        const float titleH = g_fontSize * 1.4f;
+                        const float margin = 8.f;
+
+                        // Draw shared GPU name above both charts
+                        {
+                            ID2D1SolidColorBrush* pBrush = nullptr;
+                            if (SUCCEEDED(g_pDCRT->CreateSolidColorBrush(
+                                    D2D1::ColorF(0.f, 0.f, 0.f, 1.f), &pBrush)))
+                            {
+                                D2D1_RECT_F titleRect = { x + margin, y, x + colW - margin, y + titleH };
+                                DrawTextEllipsis(g_pDCRT, g_charts[1].name,
+                                                 (UINT32)wcslen(g_charts[1].name),
+                                                 g_pChartFmtL, titleRect, pBrush);
+                                pBrush->Release();
+                            }
+                        }
+
+                        float halfW  = colW / 2.f;
+                        float chartY = y + titleH;
+                        D2D1_RECT_F leftArea  = { x,          chartY, x + halfW, y + rowH };
+                        D2D1_RECT_F rightArea = { x + halfW,  chartY, x + colW,  y + rowH };
+                        int miniSamples = max(2, CHART_SAMPLES / 2);
+                        DrawChart(g_pDCRT, g_charts[1],    leftArea,  nullptr, g_pChartFmtR, miniSamples);
+                        DrawChart(g_pDCRT, g_gpuVramChart, rightArea, nullptr, g_pChartFmtR, miniSamples);
+                    }
+                }
+                else if (i == 3 && g_diskMode > 0)
+                {
+                    int di = g_diskMode - 1;
+                    const Chart& dc = (di < g_diskCount) ? g_diskCharts[di] : g_charts[3];
+                    DrawChart(g_pDCRT, dc, area, g_pChartFmtL, g_pChartFmtR);
                 }
                 else
                 {
@@ -1609,6 +1867,14 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
         GetRamName (g_charts[2].name, 256);
         GetDiskName(g_charts[3].name, 256);
 
+        // GPU VRAM and temperature chart names
+        {
+            wchar_t gpuBuf[256];
+            GetGpuName(gpuBuf, 256);
+            swprintf_s(g_gpuVramChart.name, L"%s VRAM", gpuBuf);
+            swprintf_s(g_gpuTempChart.name, L"%s Temp", gpuBuf);
+        }
+
         DetectCoreTopology();
 
         if (PdhOpenQuery(NULL, 0, &g_pdhQuery) == ERROR_SUCCESS)
@@ -1634,6 +1900,14 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
             PdhAddEnglishCounterW(g_pdhQuery,
                 L"\\Processor(*)\\% Processor Time",
                 0, &g_pdhCoreCtr);
+            // GPU temperature (best-effort; not available on all hardware/drivers)
+            PdhAddEnglishCounterW(g_pdhQuery,
+                L"\\GPU Engine(*)\\Temperature",
+                0, &g_pdhGpuTempCtr);
+            // Per-disk counters (enumerate instances first)
+            EnumerateDisks();
+            // Clamp restored disk mode to valid range
+            if (g_diskMode > g_diskCount) g_diskMode = 0;
             PdhCollectQueryData(g_pdhQuery);
         }
 
@@ -1748,6 +2022,16 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
             (float)my >= g_cpuChartRect.top  && (float)my <= g_cpuChartRect.bottom)
             return HTCLIENT;
 
+        // GPU chart row
+        if ((float)mx >= g_gpuChartRect.left && (float)mx <= g_gpuChartRect.right &&
+            (float)my >= g_gpuChartRect.top  && (float)my <= g_gpuChartRect.bottom)
+            return HTCLIENT;
+
+        // Disk chart row
+        if ((float)mx >= g_diskChartRect.left && (float)mx <= g_diskChartRect.right &&
+            (float)my >= g_diskChartRect.top  && (float)my <= g_diskChartRect.bottom)
+            return HTCLIENT;
+
         return HTCAPTION;
     }
 
@@ -1811,6 +2095,25 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
             g_cpuMode = (g_cpuMode + 1) % (maxMode + 1);
             SaveWindowState(hwnd);
             UpdateLayeredContent(hwnd);
+        }
+        else if ((float)mx >= g_gpuChartRect.left && (float)mx <= g_gpuChartRect.right &&
+                 (float)my >= g_gpuChartRect.top  && (float)my <= g_gpuChartRect.bottom)
+        {
+            // Cycle GPU mode: 0 (core) → 1 (VRAM %) → 2 (temp) → 3 (core+VRAM) → 0
+            g_gpuMode = (g_gpuMode + 1) % 4;
+            SaveWindowState(hwnd);
+            UpdateLayeredContent(hwnd);
+        }
+        else if ((float)mx >= g_diskChartRect.left && (float)mx <= g_diskChartRect.right &&
+                 (float)my >= g_diskChartRect.top  && (float)my <= g_diskChartRect.bottom)
+        {
+            if (g_diskCount > 0)
+            {
+                // Cycle: 0 (_Total) → 1 (disk 0) → 2 (disk 1) → … → 0
+                g_diskMode = (g_diskMode + 1) % (g_diskCount + 1);
+                SaveWindowState(hwnd);
+                UpdateLayeredContent(hwnd);
+            }
         }
         return 0;
     }
