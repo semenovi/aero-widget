@@ -104,8 +104,8 @@ static void ApplyBlur(HWND hwnd)
 // -----------------------------------------------------------------------
 // Layout constants
 // -----------------------------------------------------------------------
-static const float PAD   = 6.f;
-static const float VEDGE = 14.f;
+static const float PAD   = 12.f;
+static const float VEDGE = 28.f;
 
 // -----------------------------------------------------------------------
 // D2D / DirectWrite state
@@ -116,7 +116,7 @@ static IDWriteTextFormat*   g_pChartFmtL  = nullptr;   // left/top  – chart na
 static IDWriteTextFormat*   g_pChartFmtR  = nullptr;   // right/top – chart value
 static ID2D1DCRenderTarget* g_pDCRT       = nullptr;
 static IDWriteTextFormat*   g_pMonoFmt    = nullptr;   // monospace – ASCII art
-static float                g_fontSize    = 14.f;
+static float                g_fontSize    = 28.f;
 
 // -----------------------------------------------------------------------
 // Chart
@@ -2331,7 +2331,7 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
         SystemParametersInfoW(SPI_GETNONCLIENTMETRICS, sizeof(ncm), &ncm, 0);
         HDC hdc    = GetDC(hwnd);
         float dpi  = static_cast<float>(GetDeviceCaps(hdc, LOGPIXELSY));
-        g_fontSize = static_cast<float>(abs(ncm.lfMessageFont.lfHeight)) * 96.f / dpi;
+        g_fontSize = static_cast<float>(abs(ncm.lfMessageFont.lfHeight)) * 96.f / dpi * 2.f;
         ReleaseDC(hwnd, hdc);
 
         g_pDWFactory->CreateTextFormat(
