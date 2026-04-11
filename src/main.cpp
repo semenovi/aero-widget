@@ -140,6 +140,36 @@ static void FlushDisplayValues()
     }
 }
 
+// Draw text with character-level ellipsis trimming when it overflows rect width.
+static void DrawTextEllipsis(ID2D1RenderTarget* rt,
+                              const wchar_t* text, UINT32 len,
+                              IDWriteTextFormat* fmt,
+                              D2D1_RECT_F rect,
+                              ID2D1Brush* brush)
+{
+    if (!g_pDWFactory || !fmt || len == 0) return;
+    float w = rect.right - rect.left;
+    float h = rect.bottom - rect.top;
+    if (w <= 0.f || h <= 0.f) return;
+
+    IDWriteTextLayout* layout = nullptr;
+    if (FAILED(g_pDWFactory->CreateTextLayout(text, len, fmt, w, h, &layout)))
+    {
+        rt->DrawText(text, len, fmt, rect, brush);
+        return;
+    }
+    layout->SetWordWrapping(DWRITE_WORD_WRAPPING_NO_WRAP);
+    IDWriteInlineObject* ellipsis = nullptr;
+    if (SUCCEEDED(g_pDWFactory->CreateEllipsisTrimmingSign(fmt, &ellipsis)))
+    {
+        DWRITE_TRIMMING trim = { DWRITE_TRIMMING_GRANULARITY_CHARACTER, 0, 0 };
+        layout->SetTrimming(&trim, ellipsis);
+        ellipsis->Release();
+    }
+    rt->DrawTextLayout({ rect.left, rect.top }, layout, brush);
+    layout->Release();
+}
+
 static void DrawChart(ID2D1RenderTarget* rt, const Chart& c,
                       D2D1_RECT_F area,
                       IDWriteTextFormat* fmtL, IDWriteTextFormat* fmtR)
@@ -154,18 +184,47 @@ static void DrawChart(ID2D1RenderTarget* rt, const Chart& c,
     if (FAILED(rt->CreateSolidColorBrush(D2D1::ColorF(0.f, 0.f, 0.f, 1.f), &pBrush)))
         return;
 
-    if (fmtL)
-        rt->DrawText(c.name, (UINT32)wcslen(c.name), fmtL, labelArea, pBrush);
-
+    // Build value string first so we can measure its width before drawing the name.
+    wchar_t valBuf[128] = {};
     if (fmtR)
     {
-        wchar_t valBuf[128];
         if (c.displayAbsStr[0])
             swprintf_s(valBuf, L"%.1f%% / %s", c.displayCurrent * 100.0, c.displayAbsStr);
         else
             swprintf_s(valBuf, L"%.1f%%", c.displayCurrent * 100.0);
-        rt->DrawText(valBuf, (UINT32)wcslen(valBuf), fmtR, labelArea, pBrush);
     }
+
+    // Measure value text width so the name won't overlap it.
+    float valWidth = 0.f;
+    if (fmtR && valBuf[0] && g_pDWFactory)
+    {
+        IDWriteTextLayout* vl = nullptr;
+        float areaW = labelArea.right - labelArea.left;
+        if (SUCCEEDED(g_pDWFactory->CreateTextLayout(
+                valBuf, (UINT32)wcslen(valBuf), fmtR, areaW, labelH, &vl)))
+        {
+            DWRITE_TEXT_METRICS tm = {};
+            vl->GetMetrics(&tm);
+            valWidth = tm.widthIncludingTrailingWhitespace;
+            if (valWidth > areaW) valWidth = areaW;
+            vl->Release();
+        }
+    }
+
+    // Draw name truncated to the space not occupied by the value (4 px gap).
+    if (fmtL)
+    {
+        const float gap = 4.f;
+        float nameMaxW = (labelArea.right - labelArea.left) - valWidth - gap;
+        if (nameMaxW < 0.f) nameMaxW = 0.f;
+        D2D1_RECT_F nameRect = { labelArea.left, labelArea.top,
+                                  labelArea.left + nameMaxW, labelArea.bottom };
+        DrawTextEllipsis(rt, c.name, (UINT32)wcslen(c.name), fmtL, nameRect, pBrush);
+    }
+
+    // Draw value (right-aligned).
+    if (fmtR && valBuf[0])
+        rt->DrawText(valBuf, (UINT32)wcslen(valBuf), fmtR, labelArea, pBrush);
 
     rt->DrawRectangle(plotArea, pBrush, 0.75f);
 
@@ -764,8 +823,8 @@ static void DrawHabrPanel(ID2D1RenderTarget* rt, D2D1_RECT_F area, int hoverIdx)
         g_habrRects[i] = r;
         g_habrVisible  = i + 1;
 
-        rt->DrawText(articles[i].title, (UINT32)wcslen(articles[i].title),
-                     g_pChartFmtL, r, pBrush);
+        DrawTextEllipsis(rt, articles[i].title, (UINT32)wcslen(articles[i].title),
+                         g_pChartFmtL, r, pBrush);
 
         if (i == hoverIdx)
         {
@@ -964,8 +1023,8 @@ static void DrawWeather(ID2D1RenderTarget* rt, const WeatherData& wd, D2D1_RECT_
             if (!wd.ascii[j][0]) continue;
             if (y + lhMono > area.bottom) break;
             D2D1_RECT_F r = { area.left, y, area.right, y + lhMono };
-            rt->DrawText(wd.ascii[j], (UINT32)wcslen(wd.ascii[j]),
-                         g_pMonoFmt, r, pBrush);
+            DrawTextEllipsis(rt, wd.ascii[j], (UINT32)wcslen(wd.ascii[j]),
+                             g_pMonoFmt, r, pBrush);
             y += lhMono;
         }
         y += lh * 0.3f;
@@ -975,7 +1034,7 @@ static void DrawWeather(ID2D1RenderTarget* rt, const WeatherData& wd, D2D1_RECT_
     {
         if (!text[0] || y + lh > area.bottom) return;
         D2D1_RECT_F r = { area.left, y, area.right, y + lh };
-        rt->DrawText(text, (UINT32)wcslen(text), g_pChartFmtL, r, pBrush);
+        DrawTextEllipsis(rt, text, (UINT32)wcslen(text), g_pChartFmtL, r, pBrush);
         y += lh;
     };
 
