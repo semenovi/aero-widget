@@ -9,15 +9,18 @@
 #include <dxgi1_4.h>
 #include <pdh.h>
 #include <pdhmsg.h>
+#include <wininet.h>
 #include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <string.h>
 
 #pragma comment(lib, "dwmapi.lib")
 #pragma comment(lib, "d2d1.lib")
 #pragma comment(lib, "dwrite.lib")
 #pragma comment(lib, "dxgi.lib")
 #pragma comment(lib, "pdh.lib")
+#pragma comment(lib, "wininet.lib")
 
 
 // -----------------------------------------------------------------------
@@ -82,6 +85,12 @@ static void ApplyBlur(HWND hwnd)
 }
 
 // -----------------------------------------------------------------------
+// Layout constants
+// -----------------------------------------------------------------------
+static const float PAD   = 6.f;
+static const float VEDGE = 14.f;
+
+// -----------------------------------------------------------------------
 // D2D / DirectWrite state
 // -----------------------------------------------------------------------
 static ID2D1Factory*        g_pD2DFactory = nullptr;
@@ -89,6 +98,7 @@ static IDWriteFactory*      g_pDWFactory  = nullptr;
 static IDWriteTextFormat*   g_pChartFmtL  = nullptr;   // left/top  – chart name
 static IDWriteTextFormat*   g_pChartFmtR  = nullptr;   // right/top – chart value
 static ID2D1DCRenderTarget* g_pDCRT       = nullptr;
+static IDWriteTextFormat*   g_pMonoFmt    = nullptr;   // monospace – ASCII art
 static float                g_fontSize    = 14.f;
 
 // -----------------------------------------------------------------------
@@ -103,8 +113,8 @@ struct Chart
     int     head;
     int     count;
     double  current;
-    wchar_t absStr[64];     // absolute value string, updated each sample
-    double  displayCurrent; // shown in label, updated once per second
+    wchar_t absStr[64];
+    double  displayCurrent;
     wchar_t displayAbsStr[64];
 };
 
@@ -128,8 +138,6 @@ static void FlushDisplayValues()
     }
 }
 
-// Draw chart inside |area|.
-// Layout: label strip (name left, value right) sits above the bordered plot area.
 static void DrawChart(ID2D1RenderTarget* rt, const Chart& c,
                       D2D1_RECT_F area,
                       IDWriteTextFormat* fmtL, IDWriteTextFormat* fmtR)
@@ -144,7 +152,6 @@ static void DrawChart(ID2D1RenderTarget* rt, const Chart& c,
     if (FAILED(rt->CreateSolidColorBrush(D2D1::ColorF(0.f, 0.f, 0.f, 1.f), &pBrush)))
         return;
 
-    // --- Labels -------------------------------------------------------
     if (fmtL)
         rt->DrawText(c.name, (UINT32)wcslen(c.name), fmtL, labelArea, pBrush);
 
@@ -158,10 +165,8 @@ static void DrawChart(ID2D1RenderTarget* rt, const Chart& c,
         rt->DrawText(valBuf, (UINT32)wcslen(valBuf), fmtR, labelArea, pBrush);
     }
 
-    // --- Border -------------------------------------------------------
     rt->DrawRectangle(plotArea, pBrush, 0.75f);
 
-    // --- Polyline -----------------------------------------------------
     const int n = c.count;
     if (n >= 2)
     {
@@ -187,6 +192,405 @@ static void DrawChart(ID2D1RenderTarget* rt, const Chart& c,
             rt->DrawLine({ x0, y0 }, { x1, y1 }, pBrush, 0.75f);
         }
     }
+
+    pBrush->Release();
+}
+
+// -----------------------------------------------------------------------
+// Divider
+// -----------------------------------------------------------------------
+static float g_dividerX    = 0.f;
+static bool  g_draggingDiv = false;
+
+static constexpr int DIV_HIT = 4; // px hit area around divider
+
+// -----------------------------------------------------------------------
+// Weather
+// -----------------------------------------------------------------------
+struct WeatherData
+{
+    wchar_t ascii[5][72]; // ASCII weather icon (5 lines)
+    wchar_t line1[128];   // description
+    wchar_t line2[128];   // temp · humidity · wind
+    wchar_t fc[3][64];    // 3-day forecast
+    bool    valid;
+};
+
+static WeatherData      g_weather     = {};
+static CRITICAL_SECTION g_weatherCS;
+static char             g_location[256] = "";
+static HANDLE           g_weatherThread = NULL;
+
+// -----------------------------------------------------------------------
+// Config
+// -----------------------------------------------------------------------
+static void GetConfigPath(wchar_t* out, int len)
+{
+    GetModuleFileNameW(NULL, out, len);
+    wchar_t* sl = wcsrchr(out, L'\\');
+    if (sl) sl[1] = L'\0';
+    wcsncat_s(out, len, L"config.json", _TRUNCATE);
+}
+
+static void SaveDefaultConfig()
+{
+    wchar_t path[MAX_PATH];
+    GetConfigPath(path, MAX_PATH);
+    FILE* f = nullptr;
+    if (_wfopen_s(&f, path, L"w") == 0 && f)
+    {
+        fputs("{\n    \"location\": \"\"\n}\n", f);
+        fclose(f);
+    }
+}
+
+// -----------------------------------------------------------------------
+// Debug log (appends to weather_debug.log next to the executable)
+// -----------------------------------------------------------------------
+static void DbgLog(const char* fmt, ...)
+{
+    wchar_t exeDir[MAX_PATH];
+    GetModuleFileNameW(NULL, exeDir, MAX_PATH);
+    wchar_t* sl = wcsrchr(exeDir, L'\\');
+    if (sl) sl[1] = L'\0';
+    wchar_t logPath[MAX_PATH];
+    swprintf_s(logPath, L"%sweather_debug.log", exeDir);
+
+    FILE* f = nullptr;
+    if (_wfopen_s(&f, logPath, L"a") != 0 || !f) return;
+
+    va_list ap;
+    va_start(ap, fmt);
+    vfprintf(f, fmt, ap);
+    va_end(ap);
+    fclose(f);
+}
+
+// Find nth (0-based) occurrence of "key": "value" and extract value
+static bool JsonStr(const char* json, const char* key, int nth, char* out, int outLen)
+{
+    char needle[256];
+    snprintf(needle, sizeof(needle), "\"%s\"", key);
+    const char* p = json;
+    for (int i = 0; i <= nth; i++)
+    {
+        p = strstr(p, needle);
+        if (!p) return false;
+        if (i < nth) { p++; continue; }
+    }
+    p += strlen(needle);
+    while (*p && (*p == ' ' || *p == ':' || *p == '\t' || *p == '\n' || *p == '\r')) p++;
+    if (*p != '"') return false;
+    p++;
+    const char* e = strchr(p, '"');
+    if (!e) return false;
+    int n = (int)(e - p);
+    if (n >= outLen) n = outLen - 1;
+    memcpy(out, p, n);
+    out[n] = '\0';
+    return true;
+}
+
+
+static void LoadConfig()
+{
+    wchar_t path[MAX_PATH];
+    GetConfigPath(path, MAX_PATH);
+    FILE* f = nullptr;
+    if (_wfopen_s(&f, path, L"r") != 0 || !f)
+    {
+        SaveDefaultConfig();
+        return;
+    }
+    char buf[1024] = {};
+    fread(buf, 1, sizeof(buf) - 1, f);
+    fclose(f);
+    char loc[256] = {};
+    if (JsonStr(buf, "location", 0, loc, sizeof(loc)) && loc[0])
+        strncpy_s(g_location, loc, _TRUNCATE);
+}
+
+// -----------------------------------------------------------------------
+// Weather fetch thread
+// -----------------------------------------------------------------------
+static const wchar_t* WeekDay(const char* date)
+{
+    static const wchar_t* wd[] = { L"Sun", L"Mon", L"Tue", L"Wed", L"Thu", L"Fri", L"Sat" };
+    int y, m, d;
+    if (sscanf_s(date, "%d-%d-%d", &y, &m, &d) != 3) return L"?";
+    SYSTEMTIME st = {};
+    st.wYear = (WORD)y; st.wMonth = (WORD)m; st.wDay = (WORD)d;
+    FILETIME ft;
+    if (!SystemTimeToFileTime(&st, &ft)) return L"?";
+    FileTimeToSystemTime(&ft, &st);
+    return wd[st.wDayOfWeek % 7];
+}
+
+// Fetch a URL path from wttr.in over HTTPS; caller must free() the result.
+static char* WttrGet(const wchar_t* path, const wchar_t* ua = L"AeroWidget/1.0",
+                     bool doLog = false)
+{
+    wchar_t url[1024];
+    swprintf_s(url, L"https://wttr.in%s", path);
+
+    HINTERNET hInet = InternetOpenW(ua, INTERNET_OPEN_TYPE_PRECONFIG, nullptr, nullptr, 0);
+    if (!hInet) return nullptr;
+
+    // Increase receive timeout to 90 s — wttr.in sends chunked data slowly
+    DWORD recvTimeout = 90000;
+    InternetSetOption(hInet, INTERNET_OPTION_RECEIVE_TIMEOUT, &recvTimeout, sizeof(recvTimeout));
+
+    HINTERNET hUrl = InternetOpenUrlW(hInet, url, nullptr, 0,
+        INTERNET_FLAG_SECURE | INTERNET_FLAG_RELOAD | INTERNET_FLAG_NO_CACHE_WRITE, 0);
+
+    char* body = nullptr;
+    int   blen = 0;
+
+    if (hUrl)
+    {
+        if (doLog)
+        {
+            // Log HTTP status
+            DWORD statusCode = 0, scLen = sizeof(statusCode);
+            if (HttpQueryInfoW(hUrl, HTTP_QUERY_STATUS_CODE | HTTP_QUERY_FLAG_NUMBER,
+                    &statusCode, &scLen, nullptr))
+                DbgLog("HTTP status: %lu\n", statusCode);
+            else
+                DbgLog("HTTP status: (unknown)\n");
+
+            // Log Content-Length (may be absent for chunked)
+            wchar_t clBuf[64] = {}; DWORD clLen = sizeof(clBuf) - 2;
+            if (HttpQueryInfoW(hUrl, HTTP_QUERY_CONTENT_LENGTH, clBuf, &clLen, nullptr))
+                DbgLog("Content-Length: %ls\n", clBuf);
+            else
+                DbgLog("Content-Length: (absent)\n");
+
+            // Log Transfer-Encoding
+            wchar_t teBuf[64] = {}; DWORD teLen = sizeof(teBuf) - 2;
+            if (HttpQueryInfoW(hUrl, HTTP_QUERY_TRANSFER_ENCODING, teBuf, &teLen, nullptr))
+                DbgLog("Transfer-Encoding: %ls\n", teBuf);
+            else
+                DbgLog("Transfer-Encoding: (absent)\n");
+        }
+
+        const int CAP = 256 * 1024;
+        body = (char*)malloc(CAP);
+        if (body)
+        {
+            DWORD rd = 0;
+            int iter = 0;
+            while (blen < CAP - 1)
+            {
+                DWORD toRead = (DWORD)min(4096, CAP - 1 - blen);
+                BOOL rdOk = InternetReadFile(hUrl, body + blen, toRead, &rd);
+                if (doLog)
+                    DbgLog("  iter %d: ReadData ok=%d rd=%lu total=%d\n",
+                           iter, (int)rdOk, rd, blen + (int)rd);
+                if (!rdOk || rd == 0) break;
+                blen += (int)rd;
+                iter++;
+            }
+            body[blen] = '\0';
+            if (blen == 0) { free(body); body = nullptr; }
+        }
+        InternetCloseHandle(hUrl);
+    }
+    InternetCloseHandle(hInet);
+    return body;
+}
+
+static DWORD WINAPI WeatherThreadProc(LPVOID)
+{
+    // Build URL-encoded location (empty = auto-detect by IP)
+    wchar_t wloc[256] = {};
+    MultiByteToWideChar(CP_UTF8, 0, g_location, -1, wloc, 256);
+
+    wchar_t encLoc[512] = {};
+    for (int i = 0, j = 0; wloc[i] && j < 508; i++)
+    {
+        if (wloc[i] == L' ') { encLoc[j++] = L'%'; encLoc[j++] = L'2'; encLoc[j++] = L'0'; }
+        else encLoc[j++] = wloc[i];
+    }
+
+    WeatherData wd = {};
+
+    // ── Request 1: JSON (current conditions + forecast) ──────────────────
+    {
+        wchar_t path[512];
+        swprintf_s(path, L"/%s?format=j1&m", encLoc);
+        DbgLog("=== WeatherThreadProc ===\n");
+        char* body = WttrGet(path, L"AeroWidget/1.0", /*doLog=*/true);
+        if (body)
+        {
+            int blen = (int)strlen(body);
+            DbgLog("body length: %d\n", blen);
+
+            // Log first 200 chars of body to confirm it looks like JSON
+            char preview[201] = {};
+            strncpy_s(preview, body, 200);
+            DbgLog("body[0..200]: %.200s\n\n", preview);
+
+            char tmp[256];
+
+            // Description
+            const char* wdPos = strstr(body, "\"weatherDesc\"");
+            if (wdPos && JsonStr(wdPos, "value", 0, tmp, sizeof(tmp)))
+                MultiByteToWideChar(CP_UTF8, 0, tmp, -1, wd.line1, 128);
+
+            // Current stats
+            char tempC[16]={}, humStr[16]={}, windStr[16]={};
+            JsonStr(body, "temp_C",        0, tempC,   sizeof(tempC));
+            JsonStr(body, "humidity",      0, humStr,  sizeof(humStr));
+            JsonStr(body, "windspeedKmph", 0, windStr, sizeof(windStr));
+
+            wchar_t wtmpC[16]={}, whum[16]={}, wwnd[16]={};
+            MultiByteToWideChar(CP_UTF8, 0, tempC,   -1, wtmpC, 16);
+            MultiByteToWideChar(CP_UTF8, 0, humStr,  -1, whum,  16);
+            MultiByteToWideChar(CP_UTF8, 0, windStr, -1, wwnd,  16);
+            swprintf_s(wd.line2, L"%s\u00B0C \u00B7 %s%% \u00B7 %s\u00A0km/h",
+                       wtmpC, whum, wwnd);
+
+            // 3-day forecast.
+            {
+                const char* wStart = strstr(body, "\"weather\":");
+                DbgLog("\"weather\":  %s\n", wStart ? "FOUND" : "NOT FOUND");
+
+                if (wStart)
+                {
+                    DbgLog("offset of \"weather\": %d\n", (int)(wStart - body));
+
+                    for (int day = 0; day < 3; day++)
+                    {
+                        char date[32]={}, maxT[16]={}, minT[16]={};
+
+                        bool okDate = JsonStr(wStart, "date",     day, date, sizeof(date));
+                        bool okMax  = JsonStr(wStart, "maxtempC", day, maxT, sizeof(maxT));
+                        bool okMin  = JsonStr(wStart, "mintempC", day, minT, sizeof(minT));
+
+                        DbgLog("day[%d]: date=%s(%d) maxT=%s(%d) minT=%s(%d)\n",
+                               day,
+                               okDate ? date : "FAIL", okDate,
+                               okMax  ? maxT : "FAIL", okMax,
+                               okMin  ? minT : "FAIL", okMin);
+
+                        if (!okDate || !okMax || !okMin) break;
+
+                        wchar_t wmaxT[16]={}, wminT[16]={};
+                        MultiByteToWideChar(CP_UTF8, 0, maxT, -1, wmaxT, 16);
+                        MultiByteToWideChar(CP_UTF8, 0, minT, -1, wminT, 16);
+                        swprintf_s(wd.fc[day], L"%-3s  %s\u2013%s\u00B0C",
+                                   WeekDay(date), wminT, wmaxT);
+                    }
+                }
+            }
+
+            free(body);
+        }
+        else
+        {
+            DbgLog("body is NULL (request failed)\n");
+        }
+    }
+
+    // ── Request 2: ASCII art (current weather only, no ANSI codes) ───────
+    // curl User-Agent is required — wttr.in returns HTML for other agents
+    {
+        wchar_t path[512];
+        swprintf_s(path, L"/%s?T&q&0&m", encLoc);
+        char* ab = WttrGet(path, L"curl/7.68.0");
+        DbgLog("ascii body: %s\n", ab ? "OK" : "NULL");
+        if (ab)
+        {
+            char apreview[201] = {};
+            strncpy_s(apreview, ab, 200);
+            DbgLog("ascii[0..200]: %.200s\n", apreview);
+
+            int lineIdx = 0;
+            const char* lp = ab;
+            while (*lp && lineIdx < 5)
+            {
+                const char* le = lp;
+                while (*le && *le != '\n') le++;
+
+                int len = (int)(le - lp);
+                if (len > 0 && lp[len - 1] == '\r') len--;
+
+                // wttr.in ASCII art lines always start with a space.
+                // Skip lines that don't (e.g. site-name headers like "wttr.in").
+                bool hasContent = (len > 0 && lp[0] == ' ');
+
+                if (hasContent)
+                {
+                    if (len > 71) len = 71;
+                    int wlen = MultiByteToWideChar(CP_UTF8, 0, lp, len,
+                                                   wd.ascii[lineIdx], 72);
+                    if (wlen > 0) wd.ascii[lineIdx][wlen] = L'\0';
+                    lineIdx++;
+                }
+
+                lp = (*le == '\n') ? le + 1 : le;
+            }
+            DbgLog("ascii lines parsed: %d\n", lineIdx);
+            free(ab);
+        }
+    }
+
+    wd.valid = true;
+    EnterCriticalSection(&g_weatherCS);
+    g_weather = wd;
+    LeaveCriticalSection(&g_weatherCS);
+    return 0;
+}
+
+static void StartWeatherFetch()
+{
+    if (g_weatherThread) { CloseHandle(g_weatherThread); g_weatherThread = NULL; }
+    g_weatherThread = CreateThread(nullptr, 0, WeatherThreadProc, nullptr, 0, nullptr);
+}
+
+// -----------------------------------------------------------------------
+// Draw weather panel
+// -----------------------------------------------------------------------
+static void DrawWeather(ID2D1RenderTarget* rt, const WeatherData& wd, D2D1_RECT_F area)
+{
+    if (!wd.valid || !g_pChartFmtL) return;
+
+    ID2D1SolidColorBrush* pBrush = nullptr;
+    if (FAILED(rt->CreateSolidColorBrush(D2D1::ColorF(0.f, 0.f, 0.f, 1.f), &pBrush))) return;
+
+    const float lh     = g_fontSize * 1.4f;
+    const float lhMono = g_fontSize * 1.4f;   // same line height as main text
+    float y = area.top;
+
+    // ASCII art icon (monospace, compact)
+    if (g_pMonoFmt)
+    {
+        for (int j = 0; j < 5; j++)
+        {
+            if (!wd.ascii[j][0]) continue;
+            if (y + lhMono > area.bottom) break;
+            D2D1_RECT_F r = { area.left, y, area.right, y + lhMono };
+            rt->DrawText(wd.ascii[j], (UINT32)wcslen(wd.ascii[j]),
+                         g_pMonoFmt, r, pBrush);
+            y += lhMono;
+        }
+        y += lh * 0.3f;
+    }
+
+    auto drawLine = [&](const wchar_t* text)
+    {
+        if (!text[0] || y + lh > area.bottom) return;
+        D2D1_RECT_F r = { area.left, y, area.right, y + lh };
+        rt->DrawText(text, (UINT32)wcslen(text), g_pChartFmtL, r, pBrush);
+        y += lh;
+    };
+
+    drawLine(wd.line1);
+    drawLine(wd.line2);
+    y += lh * 0.5f;
+
+    for (int i = 0; i < 3; i++)
+        drawLine(wd.fc[i]);
 
     pBrush->Release();
 }
@@ -435,30 +839,53 @@ static void UpdateLayeredContent(HWND hwnd)
     if (!hBmp) { DeleteDC(hdcMem); ReleaseDC(NULL, hdcScreen); return; }
     HBITMAP hOld = (HBITMAP)SelectObject(hdcMem, hBmp);
 
-    // --- D2D drawing --------------------------------------------------
     RECT rcD2D = { 0, 0, w, h };
     if (SUCCEEDED(g_pDCRT->BindDC(hdcMem, &rcD2D)))
     {
         g_pDCRT->BeginDraw();
         g_pDCRT->Clear(D2D1::ColorF(0.f, 0.f, 0.f, 1.f / 255.f));
 
-        // vertical stack: CPU / GPU / RAM / Disk
-        const float pad    = 6.f;
-        const float vEdge  = 14.f; // matches DrawChart's inner margin (8) + pad (6)
-        const float colW   = (float)w - 2.f * pad;
-        const float rowH   = ((float)h - 2.f * vEdge - (NUM_CHARTS - 1) * pad) / NUM_CHARTS;
-
-        for (int i = 0; i < NUM_CHARTS; ++i)
+        // --- Weather panel (left of divider) ---
+        if (g_dividerX > 2.f * PAD)
         {
-            float x = pad;
-            float y = vEdge + i * (rowH + pad);
-            D2D1_RECT_F area = { x, y, x + colW, y + rowH };
-            DrawChart(g_pDCRT, g_charts[i], area, g_pChartFmtL, g_pChartFmtR);
+            WeatherData wd;
+            EnterCriticalSection(&g_weatherCS);
+            wd = g_weather;
+            LeaveCriticalSection(&g_weatherCS);
+            D2D1_RECT_F weatherArea = { PAD, VEDGE, g_dividerX - PAD, (float)h - VEDGE };
+            DrawWeather(g_pDCRT, wd, weatherArea);
+        }
+
+        // --- Divider line (same stroke as chart borders) ---
+        {
+            ID2D1SolidColorBrush* pDiv = nullptr;
+            if (SUCCEEDED(g_pDCRT->CreateSolidColorBrush(D2D1::ColorF(0.f, 0.f, 0.f, 1.f), &pDiv)))
+            {
+                g_pDCRT->DrawLine(
+                    D2D1::Point2F(g_dividerX, VEDGE),
+                    D2D1::Point2F(g_dividerX, (float)h - VEDGE),
+                    pDiv, 0.75f);
+                pDiv->Release();
+            }
+        }
+
+        // --- Charts (right of divider) ---
+        {
+            const float chartLeft = g_dividerX + PAD;
+            const float colW = (float)w - chartLeft - PAD;
+            const float rowH = ((float)h - 2.f * VEDGE - (NUM_CHARTS - 1) * PAD) / NUM_CHARTS;
+
+            for (int i = 0; i < NUM_CHARTS; ++i)
+            {
+                float x = chartLeft;
+                float y = VEDGE + i * (rowH + PAD);
+                D2D1_RECT_F area = { x, y, x + colW, y + rowH };
+                DrawChart(g_pDCRT, g_charts[i], area, g_pChartFmtL, g_pChartFmtR);
+            }
         }
 
         g_pDCRT->EndDraw();
     }
-    // ------------------------------------------------------------------
 
     POINT         ptSrc  = { 0, 0 };
     POINT         ptDst  = { rcWin.left, rcWin.top };
@@ -497,7 +924,6 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
         g_fontSize = static_cast<float>(abs(ncm.lfMessageFont.lfHeight)) * 96.f / dpi;
         ReleaseDC(hwnd, hdc);
 
-        // Chart label format – left aligned
         g_pDWFactory->CreateTextFormat(
             ncm.lfMessageFont.lfFaceName, nullptr,
             DWRITE_FONT_WEIGHT_NORMAL, DWRITE_FONT_STYLE_NORMAL,
@@ -508,7 +934,6 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
             g_pChartFmtL->SetParagraphAlignment(DWRITE_PARAGRAPH_ALIGNMENT_CENTER);
         }
 
-        // Chart value format – right aligned
         g_pDWFactory->CreateTextFormat(
             ncm.lfMessageFont.lfFaceName, nullptr,
             DWRITE_FONT_WEIGHT_NORMAL, DWRITE_FONT_STYLE_NORMAL,
@@ -519,7 +944,18 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
             g_pChartFmtR->SetParagraphAlignment(DWRITE_PARAGRAPH_ALIGNMENT_CENTER);
         }
 
-        // DXGI adapter for GPU total VRAM
+        // Monospace format for ASCII art — same size as main font
+        g_pDWFactory->CreateTextFormat(
+            L"Consolas", nullptr,
+            DWRITE_FONT_WEIGHT_NORMAL, DWRITE_FONT_STYLE_NORMAL,
+            DWRITE_FONT_STRETCH_NORMAL, g_fontSize, L"", &g_pMonoFmt);
+        if (g_pMonoFmt)
+        {
+            g_pMonoFmt->SetTextAlignment(DWRITE_TEXT_ALIGNMENT_LEADING);
+            g_pMonoFmt->SetParagraphAlignment(DWRITE_PARAGRAPH_ALIGNMENT_NEAR);
+            g_pMonoFmt->SetWordWrapping(DWRITE_WORD_WRAPPING_NO_WRAP);
+        }
+
         {
             IDXGIFactory* factory = nullptr;
             if (SUCCEEDED(CreateDXGIFactory(__uuidof(IDXGIFactory), (void**)&factory)))
@@ -536,13 +972,11 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
             }
         }
 
-        // Device names -> chart titles
         GetCpuName (g_charts[0].name, 256);
         GetGpuName (g_charts[1].name, 256);
         GetRamName (g_charts[2].name, 256);
         GetDiskName(g_charts[3].name, 256);
 
-        // PDH query: GPU engine utilization + disk I/O
         if (PdhOpenQuery(NULL, 0, &g_pdhQuery) == ERROR_SUCCESS)
         {
             PdhAddEnglishCounterW(g_pdhQuery,
@@ -563,10 +997,9 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
             PdhAddEnglishCounterW(g_pdhQuery,
                 L"\\GPU Adapter Memory(*)\\Dedicated Usage",
                 0, &g_pdhGpuMemCtr);
-            PdhCollectQueryData(g_pdhQuery); // baseline
+            PdhCollectQueryData(g_pdhQuery);
         }
 
-        // CPU baseline (seed prev values so first delta is valid)
         {
             FILETIME fi, fk, fu;
             GetSystemTimes(&fi, &fk, &fu);
@@ -577,11 +1010,21 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
             g_cpuPrevTotal = f2u(fk) + f2u(fu);
         }
 
-        // Initial flush so labels show something on first paint
         SampleMetrics();
         FlushDisplayValues();
 
-        SetTimer(hwnd, 1, 50, nullptr); // ~20 fps
+        // Init divider at ~28% of window width
+        {
+            RECT rc; GetWindowRect(hwnd, &rc);
+            g_dividerX = (float)(rc.right - rc.left) * 0.28f;
+        }
+
+        // Load config and kick weather fetch
+        LoadConfig();
+        StartWeatherFetch();
+
+        SetTimer(hwnd, 1, 50, nullptr);       // ~20 fps chart update
+        SetTimer(hwnd, 2, 600000, nullptr);   // weather refresh every 10 min
 
         UpdateLayeredContent(hwnd);
         return 0;
@@ -590,14 +1033,21 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
     // ------------------------------------------------------------------
     case WM_TIMER:
     {
-        if (g_pdhQuery) PdhCollectQueryData(g_pdhQuery);
-        SampleMetrics();
-        if (++g_labelTick >= 20) // 20 * 50ms = 1 second
+        if (wParam == 1)
         {
-            g_labelTick = 0;
-            FlushDisplayValues();
+            if (g_pdhQuery) PdhCollectQueryData(g_pdhQuery);
+            SampleMetrics();
+            if (++g_labelTick >= 20)
+            {
+                g_labelTick = 0;
+                FlushDisplayValues();
+            }
+            UpdateLayeredContent(hwnd);
         }
-        UpdateLayeredContent(hwnd);
+        else if (wParam == 2)
+        {
+            StartWeatherFetch();
+        }
         return 0;
     }
 
@@ -622,7 +1072,70 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
         if (L)      return HTLEFT;
         if (R)      return HTRIGHT;
 
+        // Divider hit area → client (so WM_LBUTTONDOWN fires)
+        int mx = pt.x - rc.left;
+        int my = pt.y - rc.top;
+        int wh = rc.bottom - rc.top;
+        if (abs(mx - (int)g_dividerX) <= DIV_HIT &&
+            my >= (int)VEDGE && my <= wh - (int)VEDGE)
+            return HTCLIENT;
+
         return HTCAPTION;
+    }
+
+    // ------------------------------------------------------------------
+    case WM_SETCURSOR:
+    {
+        if (LOWORD(lParam) == HTCLIENT)
+        {
+            POINT pt; GetCursorPos(&pt);
+            RECT rc; GetWindowRect(hwnd, &rc);
+            int mx = pt.x - rc.left;
+            int my = pt.y - rc.top;
+            int wh = rc.bottom - rc.top;
+            if (abs(mx - (int)g_dividerX) <= DIV_HIT &&
+                my >= (int)VEDGE && my <= wh - (int)VEDGE)
+            {
+                SetCursor(LoadCursorW(NULL, IDC_SIZEWE));
+                return TRUE;
+            }
+        }
+        break;
+    }
+
+    // ------------------------------------------------------------------
+    case WM_LBUTTONDOWN:
+    {
+        int mx = GET_X_LPARAM(lParam);
+        if (abs(mx - (int)g_dividerX) <= DIV_HIT)
+        {
+            g_draggingDiv = true;
+            SetCapture(hwnd);
+        }
+        return 0;
+    }
+
+    case WM_MOUSEMOVE:
+    {
+        if (g_draggingDiv)
+        {
+            int mx = GET_X_LPARAM(lParam);
+            RECT rc; GetWindowRect(hwnd, &rc);
+            int w = rc.right - rc.left;
+            g_dividerX = max(80.f, min((float)mx, (float)w - 80.f));
+            UpdateLayeredContent(hwnd);
+        }
+        return 0;
+    }
+
+    case WM_LBUTTONUP:
+    {
+        if (g_draggingDiv)
+        {
+            g_draggingDiv = false;
+            ReleaseCapture();
+        }
+        return 0;
     }
 
     // ------------------------------------------------------------------
@@ -630,7 +1143,12 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
     {
         const auto* wp = reinterpret_cast<const WINDOWPOS*>(lParam);
         if (!(wp->flags & SWP_NOMOVE) || !(wp->flags & SWP_NOSIZE))
+        {
+            RECT rc; GetWindowRect(hwnd, &rc);
+            int w = rc.right - rc.left;
+            g_dividerX = max(80.f, min(g_dividerX, (float)w - 80.f));
             UpdateLayeredContent(hwnd);
+        }
         return 0;
     }
 
@@ -665,9 +1183,18 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
     // ------------------------------------------------------------------
     case WM_DESTROY:
         KillTimer(hwnd, 1);
-        if (g_pdhQuery)      { PdhCloseQuery(g_pdhQuery); g_pdhQuery = NULL; }
-        if (g_pChartFmtR) { g_pChartFmtR->Release(); g_pChartFmtR = nullptr; }
-        if (g_pChartFmtL) { g_pChartFmtL->Release(); g_pChartFmtL = nullptr; }
+        KillTimer(hwnd, 2);
+        if (g_weatherThread)
+        {
+            WaitForSingleObject(g_weatherThread, 2000);
+            CloseHandle(g_weatherThread);
+            g_weatherThread = NULL;
+        }
+        DeleteCriticalSection(&g_weatherCS);
+        if (g_pdhQuery)   { PdhCloseQuery(g_pdhQuery); g_pdhQuery = NULL; }
+        if (g_pMonoFmt)  { g_pMonoFmt->Release();   g_pMonoFmt   = nullptr; }
+        if (g_pChartFmtR){ g_pChartFmtR->Release(); g_pChartFmtR = nullptr; }
+        if (g_pChartFmtL){ g_pChartFmtL->Release(); g_pChartFmtL = nullptr; }
         if (g_pDCRT)      { g_pDCRT->Release();       g_pDCRT      = nullptr; }
         if (g_pDWFactory) { g_pDWFactory->Release();  g_pDWFactory = nullptr; }
         if (g_pD2DFactory){ g_pD2DFactory->Release(); g_pD2DFactory = nullptr; }
@@ -683,6 +1210,8 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
 // -----------------------------------------------------------------------
 int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow)
 {
+    InitializeCriticalSection(&g_weatherCS);
+
     D2D1CreateFactory(D2D1_FACTORY_TYPE_SINGLE_THREADED, &g_pD2DFactory);
     DWriteCreateFactory(DWRITE_FACTORY_TYPE_SHARED,
                         __uuidof(IDWriteFactory),
@@ -709,7 +1238,7 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow)
         CLASS_NAME,
         L"BlurBox",
         WS_POPUP | WS_VISIBLE,
-        CW_USEDEFAULT, CW_USEDEFAULT, 400, 560,
+        CW_USEDEFAULT, CW_USEDEFAULT, 600, 560,
         NULL, NULL, hInstance, NULL);
 
     if (!hwnd) return 1;
