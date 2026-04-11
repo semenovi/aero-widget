@@ -24,6 +24,20 @@
 #pragma comment(lib, "wininet.lib")
 #pragma comment(lib, "shell32.lib")
 
+// -----------------------------------------------------------------------
+// NVML (NVIDIA Management Library) – dynamic loading, no import lib needed
+// Works with RTX 5080 / Blackwell and all modern NVIDIA GPUs.
+// -----------------------------------------------------------------------
+typedef int   nvmlReturn_t;
+typedef void* nvmlDevice_t;
+#define NVML_SUCCESS          0
+#define NVML_TEMPERATURE_GPU  0
+
+typedef nvmlReturn_t (*PFN_nvmlInit)(void);
+typedef nvmlReturn_t (*PFN_nvmlShutdown)(void);
+typedef nvmlReturn_t (*PFN_nvmlDeviceGetHandleByIndex)(unsigned int, nvmlDevice_t*);
+typedef nvmlReturn_t (*PFN_nvmlDeviceGetTemperature)(nvmlDevice_t, int, unsigned int*);
+
 
 // -----------------------------------------------------------------------
 // Undocumented Windows 10/11 composition API (user32.dll)
@@ -144,6 +158,12 @@ static Chart        g_gpuVramChart  = {};
 static Chart        g_gpuTempChart  = {};
 static PDH_HCOUNTER g_pdhGpuTempCtr = NULL;
 static D2D1_RECT_F  g_gpuChartRect  = {};
+
+// NVML state (prefer over PDH for GPU temperature)
+static HMODULE                        g_hNvml         = NULL;
+static nvmlDevice_t                   g_nvmlDevice    = NULL;
+static PFN_nvmlDeviceGetTemperature   g_nvmlGetTemp   = NULL;
+static PFN_nvmlShutdown               g_nvmlShutdown  = NULL;
 
 // -----------------------------------------------------------------------
 // Per-disk state
@@ -1493,11 +1513,25 @@ static void SampleMetrics()
             PushChartValue(g_gpuVramChart, 0.0);
         }
 
-        // GPU temperature (best-effort via PDH; may not be available on all hardware)
+        // GPU temperature: prefer NVML (reliable on RTX 5080/Blackwell),
+        // fall back to PDH on non-NVIDIA or older drivers.
         {
             double tempC  = 0.0;
             bool   gotTemp = false;
-            if (g_pdhGpuTempCtr)
+
+            // --- NVML path ---
+            if (g_nvmlDevice && g_nvmlGetTemp)
+            {
+                unsigned int t = 0;
+                if (g_nvmlGetTemp(g_nvmlDevice, NVML_TEMPERATURE_GPU, &t) == NVML_SUCCESS)
+                {
+                    tempC   = (double)t;
+                    gotTemp = true;
+                }
+            }
+
+            // --- PDH fallback (AMD / Intel / older NVIDIA drivers) ---
+            if (!gotTemp && g_pdhGpuTempCtr)
             {
                 DWORD sz3 = 0, cnt3 = 0;
                 PdhGetFormattedCounterArrayW(g_pdhGpuTempCtr, PDH_FMT_DOUBLE,
@@ -1911,6 +1945,53 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
             PdhCollectQueryData(g_pdhQuery);
         }
 
+        // Try to load NVML for reliable GPU temperature (works with RTX 5080 / Blackwell
+        // where the PDH "GPU Engine\Temperature" counter is unavailable).
+        {
+            // nvml.dll lives in System32 on modern driver installs; also try NVSMI path.
+            g_hNvml = LoadLibraryW(L"nvml.dll");
+            if (!g_hNvml)
+            {
+                wchar_t nvsmi[MAX_PATH];
+                ExpandEnvironmentStringsW(
+                    L"%ProgramFiles%\\NVIDIA Corporation\\NVSMI\\nvml.dll",
+                    nvsmi, MAX_PATH);
+                g_hNvml = LoadLibraryW(nvsmi);
+            }
+            if (g_hNvml)
+            {
+                // Prefer versioned entry points introduced in NVML r304+
+                auto pfnInit = (PFN_nvmlInit)GetProcAddress(g_hNvml, "nvmlInit_v2");
+                if (!pfnInit)
+                    pfnInit = (PFN_nvmlInit)GetProcAddress(g_hNvml, "nvmlInit");
+
+                auto pfnHandle = (PFN_nvmlDeviceGetHandleByIndex)
+                    GetProcAddress(g_hNvml, "nvmlDeviceGetHandleByIndex_v2");
+                if (!pfnHandle)
+                    pfnHandle = (PFN_nvmlDeviceGetHandleByIndex)
+                        GetProcAddress(g_hNvml, "nvmlDeviceGetHandleByIndex");
+
+                g_nvmlGetTemp  = (PFN_nvmlDeviceGetTemperature)
+                    GetProcAddress(g_hNvml, "nvmlDeviceGetTemperature");
+                g_nvmlShutdown = (PFN_nvmlShutdown)
+                    GetProcAddress(g_hNvml, "nvmlShutdown");
+
+                if (pfnInit && pfnHandle && g_nvmlGetTemp &&
+                    pfnInit() == NVML_SUCCESS)
+                {
+                    pfnHandle(0, &g_nvmlDevice);
+                }
+
+                if (!g_nvmlDevice)
+                {
+                    if (g_nvmlShutdown) g_nvmlShutdown();
+                    FreeLibrary(g_hNvml);
+                    g_hNvml       = NULL;
+                    g_nvmlGetTemp = NULL;
+                }
+            }
+        }
+
         {
             FILETIME fi, fk, fu;
             GetSystemTimes(&fi, &fk, &fu);
@@ -2271,6 +2352,12 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
         }
         DeleteCriticalSection(&g_weatherCS);
         DeleteCriticalSection(&g_habrCS);
+        if (g_hNvml)
+        {
+            if (g_nvmlShutdown) g_nvmlShutdown();
+            FreeLibrary(g_hNvml);
+            g_hNvml = NULL;
+        }
         if (g_pdhQuery)   { PdhCloseQuery(g_pdhQuery); g_pdhQuery = NULL; }
         if (g_pMonoFmt)  { g_pMonoFmt->Release();   g_pMonoFmt   = nullptr; }
         if (g_pChartFmtR){ g_pChartFmtR->Release(); g_pChartFmtR = nullptr; }
