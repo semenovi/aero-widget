@@ -221,6 +221,16 @@ static CRITICAL_SECTION g_weatherCS;
 static char             g_location[256] = "";
 static HANDLE           g_weatherThread = NULL;
 
+// Saved window-state globals (loaded from config before window creation)
+static const int CFG_UNSET = -99999;
+static int   g_cfgMonitorLeft = CFG_UNSET;
+static int   g_cfgMonitorTop  = CFG_UNSET;
+static int   g_cfgWinX        = CFG_UNSET;
+static int   g_cfgWinY        = CFG_UNSET;
+static int   g_cfgWinW        = -1;
+static int   g_cfgWinH        = -1;
+static float g_cfgDividerX    = -1.f;
+
 // -----------------------------------------------------------------------
 // Config
 // -----------------------------------------------------------------------
@@ -242,6 +252,77 @@ static void SaveDefaultConfig()
         fputs("{\n    \"location\": \"\"\n}\n", f);
         fclose(f);
     }
+}
+
+// -----------------------------------------------------------------------
+// Monitor search helper (used for save/restore window position)
+// -----------------------------------------------------------------------
+struct MonitorSearchCtx
+{
+    int      targetLeft, targetTop;
+    HMONITOR found;
+    RECT     rcMonitor;
+};
+
+static BOOL CALLBACK FindMonitorProc(HMONITOR hMon, HDC, LPRECT, LPARAM lp)
+{
+    auto* ctx = reinterpret_cast<MonitorSearchCtx*>(lp);
+    MONITORINFO mi = { sizeof(mi) };
+    if (GetMonitorInfoW(hMon, &mi) &&
+        mi.rcMonitor.left == ctx->targetLeft &&
+        mi.rcMonitor.top  == ctx->targetTop)
+    {
+        ctx->found     = hMon;
+        ctx->rcMonitor = mi.rcMonitor;
+        return FALSE; // stop enumeration
+    }
+    return TRUE;
+}
+
+// Save current window position, size, monitor and divider to config.json
+static void SaveWindowState(HWND hwnd)
+{
+    RECT rcWin;
+    if (!GetWindowRect(hwnd, &rcWin)) return;
+
+    HMONITOR hMon = MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST);
+    MONITORINFO mi = { sizeof(mi) };
+    if (!GetMonitorInfoW(hMon, &mi)) return;
+
+    int monL = mi.rcMonitor.left;
+    int monT = mi.rcMonitor.top;
+    int relX = rcWin.left - monL;
+    int relY = rcWin.top  - monT;
+    int winW = rcWin.right  - rcWin.left;
+    int winH = rcWin.bottom - rcWin.top;
+
+    // Escape location string for JSON (handle '"' and '\')
+    char escaped[512] = {};
+    for (int i = 0, j = 0; g_location[i] && j < (int)sizeof(escaped) - 3; i++)
+    {
+        if (g_location[i] == '"' || g_location[i] == '\\')
+            escaped[j++] = '\\';
+        escaped[j++] = g_location[i];
+    }
+
+    wchar_t path[MAX_PATH];
+    GetConfigPath(path, MAX_PATH);
+    FILE* f = nullptr;
+    if (_wfopen_s(&f, path, L"w") != 0 || !f) return;
+
+    fprintf(f,
+        "{\n"
+        "    \"location\": \"%s\",\n"
+        "    \"monitor_left\": %d,\n"
+        "    \"monitor_top\": %d,\n"
+        "    \"win_x\": %d,\n"
+        "    \"win_y\": %d,\n"
+        "    \"win_w\": %d,\n"
+        "    \"win_h\": %d,\n"
+        "    \"divider_x\": %.2f\n"
+        "}\n",
+        escaped, monL, monT, relX, relY, winW, winH, (double)g_dividerX);
+    fclose(f);
 }
 
 // -----------------------------------------------------------------------
@@ -292,6 +373,34 @@ static bool JsonStr(const char* json, const char* key, int nth, char* out, int o
 }
 
 
+// Find "key": <integer> and extract value
+static bool JsonInt(const char* json, const char* key, int* out)
+{
+    char needle[256];
+    snprintf(needle, sizeof(needle), "\"%s\"", key);
+    const char* p = strstr(json, needle);
+    if (!p) return false;
+    p += strlen(needle);
+    while (*p == ' ' || *p == ':' || *p == '\t' || *p == '\n' || *p == '\r') p++;
+    if (*p != '-' && (*p < '0' || *p > '9')) return false;
+    *out = atoi(p);
+    return true;
+}
+
+// Find "key": <float> and extract value
+static bool JsonDouble(const char* json, const char* key, double* out)
+{
+    char needle[256];
+    snprintf(needle, sizeof(needle), "\"%s\"", key);
+    const char* p = strstr(json, needle);
+    if (!p) return false;
+    p += strlen(needle);
+    while (*p == ' ' || *p == ':' || *p == '\t' || *p == '\n' || *p == '\r') p++;
+    if (*p != '-' && *p != '.' && (*p < '0' || *p > '9')) return false;
+    *out = atof(p);
+    return true;
+}
+
 static void LoadConfig()
 {
     wchar_t path[MAX_PATH];
@@ -302,12 +411,25 @@ static void LoadConfig()
         SaveDefaultConfig();
         return;
     }
-    char buf[1024] = {};
+    char buf[2048] = {};
     fread(buf, 1, sizeof(buf) - 1, f);
     fclose(f);
+
     char loc[256] = {};
     if (JsonStr(buf, "location", 0, loc, sizeof(loc)) && loc[0])
         strncpy_s(g_location, loc, _TRUNCATE);
+
+    int iv = 0;
+    if (JsonInt(buf, "monitor_left", &iv)) g_cfgMonitorLeft = iv;
+    if (JsonInt(buf, "monitor_top",  &iv)) g_cfgMonitorTop  = iv;
+    if (JsonInt(buf, "win_x",        &iv)) g_cfgWinX        = iv;
+    if (JsonInt(buf, "win_y",        &iv)) g_cfgWinY        = iv;
+    if (JsonInt(buf, "win_w",        &iv) && iv > 0) g_cfgWinW = iv;
+    if (JsonInt(buf, "win_h",        &iv) && iv > 0) g_cfgWinH = iv;
+
+    double dv = 0.0;
+    if (JsonDouble(buf, "divider_x", &dv) && dv > 0.0)
+        g_cfgDividerX = (float)dv;
 }
 
 // -----------------------------------------------------------------------
@@ -1013,14 +1135,17 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
         SampleMetrics();
         FlushDisplayValues();
 
-        // Init divider at ~28% of window width
+        // Restore divider from config, or default to ~28% of window width
         {
             RECT rc; GetWindowRect(hwnd, &rc);
-            g_dividerX = (float)(rc.right - rc.left) * 0.28f;
+            int w = rc.right - rc.left;
+            if (g_cfgDividerX > 0.f)
+                g_dividerX = max(80.f, min(g_cfgDividerX, (float)w - 80.f));
+            else
+                g_dividerX = (float)w * 0.28f;
         }
 
-        // Load config and kick weather fetch
-        LoadConfig();
+        // Config already loaded in WinMain; kick weather fetch
         StartWeatherFetch();
 
         SetTimer(hwnd, 1, 50, nullptr);       // ~20 fps chart update
@@ -1182,6 +1307,7 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
 
     // ------------------------------------------------------------------
     case WM_DESTROY:
+        SaveWindowState(hwnd);
         KillTimer(hwnd, 1);
         KillTimer(hwnd, 2);
         if (g_weatherThread)
@@ -1222,6 +1348,26 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow)
         D2D1::PixelFormat(DXGI_FORMAT_B8G8R8A8_UNORM, D2D1_ALPHA_MODE_PREMULTIPLIED));
     g_pD2DFactory->CreateDCRenderTarget(&rtProps, &g_pDCRT);
 
+    // Load config before window creation to restore position/size
+    LoadConfig();
+
+    int startX = CW_USEDEFAULT, startY = CW_USEDEFAULT;
+    int startW = (g_cfgWinW > 0) ? g_cfgWinW : 600;
+    int startH = (g_cfgWinH > 0) ? g_cfgWinH : 560;
+
+    if (g_cfgMonitorLeft != CFG_UNSET && g_cfgWinX != CFG_UNSET)
+    {
+        MonitorSearchCtx msc = {};
+        msc.targetLeft = g_cfgMonitorLeft;
+        msc.targetTop  = g_cfgMonitorTop;
+        EnumDisplayMonitors(NULL, NULL, FindMonitorProc, (LPARAM)&msc);
+        if (msc.found)
+        {
+            startX = msc.rcMonitor.left + g_cfgWinX;
+            startY = msc.rcMonitor.top  + g_cfgWinY;
+        }
+    }
+
     const wchar_t CLASS_NAME[] = L"BlurBoxWnd";
 
     WNDCLASSEXW wc   = {};
@@ -1238,7 +1384,7 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow)
         CLASS_NAME,
         L"BlurBox",
         WS_POPUP | WS_VISIBLE,
-        CW_USEDEFAULT, CW_USEDEFAULT, 600, 560,
+        startX, startY, startW, startH,
         NULL, NULL, hInstance, NULL);
 
     if (!hwnd) return 1;
