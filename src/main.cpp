@@ -86,9 +86,9 @@ using PFN_SetWindowCompositionAttribute =
 // -----------------------------------------------------------------------
 static void ApplyBlur(HWND hwnd)
 {
-    auto pfn = reinterpret_cast<PFN_SetWindowCompositionAttribute>(
-        GetProcAddress(GetModuleHandleW(L"user32.dll"),
-                       "SetWindowCompositionAttribute"));
+    HMODULE hUser32 = GetModuleHandleW(L"user32.dll");
+    auto pfn = hUser32 ? reinterpret_cast<PFN_SetWindowCompositionAttribute>(
+        GetProcAddress(hUser32, "SetWindowCompositionAttribute")) : nullptr;
     if (pfn)
     {
         auto tryAccent = [&](ACCENT_STATE s) -> bool
@@ -1050,7 +1050,7 @@ static DWORD WINAPI HabrThreadProc(LPVOID)
     char* body = HttpGetUrl(L"https://habr.com/ru/rss/all/all/");
     if (!body) return 0;
 
-    HabrArticle articles[MAX_HABR] = {};
+    HabrArticle* articles = new HabrArticle[MAX_HABR]();
     int count = 0;
 
     const char* p = body;
@@ -1085,6 +1085,7 @@ static DWORD WINAPI HabrThreadProc(LPVOID)
     memcpy(g_habr, articles, sizeof(HabrArticle) * count);
     g_habrCount = count;
     LeaveCriticalSection(&g_habrCS);
+    delete[] articles;
     return 0;
 }
 
@@ -1101,7 +1102,7 @@ static void DrawHabrPanel(ID2D1RenderTarget* rt, D2D1_RECT_F area, int hoverIdx)
 {
     if (!g_pChartFmtL || !g_pDWFactory) return;
 
-    HabrArticle articles[MAX_HABR];
+    HabrArticle* articles = new HabrArticle[MAX_HABR];
     int count = 0;
     EnterCriticalSection(&g_habrCS);
     memcpy(articles, g_habr, sizeof(HabrArticle) * g_habrCount);
@@ -1112,7 +1113,10 @@ static void DrawHabrPanel(ID2D1RenderTarget* rt, D2D1_RECT_F area, int hoverIdx)
 
     ID2D1SolidColorBrush* pBrush = nullptr;
     if (FAILED(rt->CreateSolidColorBrush(D2D1::ColorF(0.f, 0.f, 0.f, 1.f), &pBrush)))
+    {
+        delete[] articles;
         return;
+    }
 
     if (count == 0)
     {
@@ -1124,6 +1128,7 @@ static void DrawHabrPanel(ID2D1RenderTarget* rt, D2D1_RECT_F area, int hoverIdx)
             pDim->Release();
         }
         pBrush->Release();
+        delete[] articles;
         return;
     }
 
@@ -1163,6 +1168,7 @@ static void DrawHabrPanel(ID2D1RenderTarget* rt, D2D1_RECT_F area, int hoverIdx)
     }
 
     pBrush->Release();
+    delete[] articles;
 }
 
 static DWORD WINAPI WeatherThreadProc(LPVOID)
@@ -1382,6 +1388,7 @@ static ULONGLONG    g_gpuTotalVram   = 0;
 // -----------------------------------------------------------------------
 static void GetCpuName(wchar_t* buf, int len)
 {
+    if (!buf || len <= 0) return;
     wcscpy_s(buf, len, L"CPU");
     HKEY hk;
     if (RegOpenKeyExW(HKEY_LOCAL_MACHINE,
@@ -1754,7 +1761,7 @@ static IWbemServices* WmiConnect(IWbemLocator* pLoc, const wchar_t* ns)
                                      0, nullptr, nullptr, &pSvc);
     SysFreeString(bns);
     if (FAILED(hr)) return nullptr;
-    CoSetProxyBlanket(pSvc, RPC_C_AUTHN_WINNT, RPC_C_AUTHZ_NONE, nullptr,
+    (void)CoSetProxyBlanket(pSvc, RPC_C_AUTHN_WINNT, RPC_C_AUTHZ_NONE, nullptr,
                       RPC_C_AUTHN_LEVEL_CALL, RPC_C_IMP_LEVEL_IMPERSONATE,
                       nullptr, EOAC_NONE);
     return pSvc;
@@ -1831,13 +1838,13 @@ static LONG WmiQueryAcpi(IWbemServices* pSvc)
 
 static DWORD WINAPI CpuTempThreadProc(LPVOID)
 {
-    CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED);
-    CoInitializeSecurity(nullptr, -1, nullptr, nullptr,
+    (void)CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED);
+    (void)CoInitializeSecurity(nullptr, -1, nullptr, nullptr,
         RPC_C_AUTHN_LEVEL_DEFAULT, RPC_C_IMP_LEVEL_IMPERSONATE,
         nullptr, EOAC_NONE, nullptr);
 
     IWbemLocator* pLoc = nullptr;
-    CoCreateInstance(CLSID_WbemLocator, nullptr, CLSCTX_INPROC_SERVER,
+    (void)CoCreateInstance(CLSID_WbemLocator, nullptr, CLSCTX_INPROC_SERVER,
                      IID_IWbemLocator, (void**)&pLoc);
 
     // Pre-connect WMI namespaces (best-effort; nullptr if unavailable)
@@ -3431,7 +3438,7 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
 // -----------------------------------------------------------------------
 // Entry point
 // -----------------------------------------------------------------------
-int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow)
+int WINAPI WinMain(_In_ HINSTANCE hInstance, _In_opt_ HINSTANCE, _In_ LPSTR, _In_ int nCmdShow)
 {
     InitializeCriticalSection(&g_weatherCS);
     InitializeCriticalSection(&g_habrCS);
