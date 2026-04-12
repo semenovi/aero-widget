@@ -29,6 +29,10 @@
 #pragma comment(lib, "oleaut32.lib")
 #pragma comment(lib, "wbemuuid.lib")
 
+#define WM_TRAYICON  (WM_APP + 1)
+#define ID_TRAY_EXIT 1001
+static NOTIFYICONDATAW g_nid = {};
+
 // -----------------------------------------------------------------------
 // NVML (NVIDIA Management Library) – dynamic loading, no import lib needed
 // Works with RTX 5080 / Blackwell and all modern NVIDIA GPUs.
@@ -2872,8 +2876,36 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
         SetTimer(hwnd, 3, g_habrRefreshMin * 60000, nullptr);     // Habr refresh
 
         UpdateLayeredContent(hwnd);
+
+        // Tray icon
+        g_nid.cbSize           = sizeof(g_nid);
+        g_nid.hWnd             = hwnd;
+        g_nid.uID              = 1;
+        g_nid.uFlags           = NIF_ICON | NIF_MESSAGE | NIF_TIP;
+        g_nid.uCallbackMessage = WM_TRAYICON;
+        g_nid.hIcon            = LoadIconW(NULL, IDI_APPLICATION);
+        wcscpy_s(g_nid.szTip, L"BlurBox");
+        Shell_NotifyIconW(NIM_ADD, &g_nid);
+
         return 0;
     }
+
+    // ------------------------------------------------------------------
+    case WM_TRAYICON:
+        if (lParam == WM_RBUTTONUP)
+        {
+            POINT pt;
+            GetCursorPos(&pt);
+            HMENU hMenu = CreatePopupMenu();
+            AppendMenuW(hMenu, MF_STRING, ID_TRAY_EXIT, L"Exit");
+            SetForegroundWindow(hwnd);
+            int cmd = TrackPopupMenu(hMenu, TPM_RETURNCMD | TPM_RIGHTBUTTON,
+                                     pt.x, pt.y, 0, hwnd, NULL);
+            DestroyMenu(hMenu);
+            if (cmd == ID_TRAY_EXIT)
+                DestroyWindow(hwnd);
+        }
+        return 0;
 
     // ------------------------------------------------------------------
     case WM_TIMER:
@@ -3342,6 +3374,7 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
         if (g_pDCRT)      { g_pDCRT->Release();       g_pDCRT      = nullptr; }
         if (g_pDWFactory) { g_pDWFactory->Release();  g_pDWFactory = nullptr; }
         if (g_pD2DFactory){ g_pD2DFactory->Release(); g_pD2DFactory = nullptr; }
+        Shell_NotifyIconW(NIM_DELETE, &g_nid);
         PostQuitMessage(0);
         return 0;
     }
@@ -3399,7 +3432,7 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow)
     RegisterClassExW(&wc);
 
     HWND hwnd = CreateWindowExW(
-        WS_EX_LAYERED,
+        WS_EX_LAYERED | WS_EX_TOOLWINDOW,
         CLASS_NAME,
         L"BlurBox",
         WS_POPUP | WS_VISIBLE,
