@@ -554,6 +554,34 @@ static CRITICAL_SECTION g_weatherCS;
 static char             g_location[256] = "";
 static HANDLE           g_weatherThread = NULL;
 
+// Autostart
+static bool g_autostart = false;
+
+static void ApplyAutostart()
+{
+    const wchar_t* keyPath = L"Software\\Microsoft\\Windows\\CurrentVersion\\Run";
+    const wchar_t* valueName = L"BlurBox";
+
+    HKEY hKey = nullptr;
+    if (RegOpenKeyExW(HKEY_CURRENT_USER, keyPath, 0, KEY_SET_VALUE, &hKey) != ERROR_SUCCESS)
+        return;
+
+    if (g_autostart)
+    {
+        wchar_t exePath[MAX_PATH];
+        GetModuleFileNameW(NULL, exePath, MAX_PATH);
+        RegSetValueExW(hKey, valueName, 0, REG_SZ,
+                       reinterpret_cast<const BYTE*>(exePath),
+                       (DWORD)((wcslen(exePath) + 1) * sizeof(wchar_t)));
+    }
+    else
+    {
+        RegDeleteValueW(hKey, valueName);
+    }
+
+    RegCloseKey(hKey);
+}
+
 // Saved window-state globals (loaded from config before window creation)
 static const int CFG_UNSET = -99999;
 static int   g_cfgMonitorLeft = CFG_UNSET;
@@ -583,7 +611,7 @@ static void SaveDefaultConfig()
     FILE* f = nullptr;
     if (_wfopen_s(&f, path, L"w") == 0 && f)
     {
-        fputs("{\n    \"location\": \"\"\n}\n", f);
+        fputs("{\n    \"location\": \"\",\n    \"autostart\": false\n}\n", f);
         fclose(f);
     }
 }
@@ -658,11 +686,13 @@ static void SaveWindowState(HWND hwnd)
         "    \"divider_x2\": %.2f,\n"
         "    \"cpu_mode\": %d,\n"
         "    \"gpu_mode\": %d,\n"
-        "    \"disk_mode\": %d\n"
+        "    \"disk_mode\": %d,\n"
+        "    \"autostart\": %s\n"
         "}\n",
         escaped, monL, monT, relX, relY, winW, winH,
         (double)g_dividerX, (double)g_dividerY, (double)g_dividerX2,
-        g_cpuMode, g_gpuMode, g_diskMode);
+        g_cpuMode, g_gpuMode, g_diskMode,
+        g_autostart ? "true" : "false");
     fclose(f);
 }
 
@@ -678,8 +708,12 @@ static void DbgLog(const char* fmt, ...)
     wchar_t logPath[MAX_PATH];
     swprintf_s(logPath, L"%sweather_debug.log", exeDir);
 
+    static bool s_firstCall = true;
+    const wchar_t* mode = s_firstCall ? L"w" : L"a";
+    s_firstCall = false;
+
     FILE* f = nullptr;
-    if (_wfopen_s(&f, logPath, L"a") != 0 || !f) return;
+    if (_wfopen_s(&f, logPath, mode) != 0 || !f) return;
 
     va_list ap;
     va_start(ap, fmt);
@@ -791,6 +825,18 @@ static void LoadConfig()
     int diskMode = 0;
     if (JsonInt(buf, "disk_mode", &diskMode) && diskMode >= 0)
         g_diskMode = diskMode; // validated against g_diskCount after enumeration
+
+    // autostart: look for "true" literal after the key
+    {
+        const char* p = strstr(buf, "\"autostart\"");
+        if (p)
+        {
+            p += strlen("\"autostart\"");
+            while (*p == ' ' || *p == ':' || *p == '\t' || *p == '\n' || *p == '\r') p++;
+            g_autostart = (strncmp(p, "true", 4) == 0);
+        }
+    }
+    ApplyAutostart();
 }
 
 // -----------------------------------------------------------------------
