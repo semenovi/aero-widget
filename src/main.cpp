@@ -1,5 +1,6 @@
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
+#include <wbemidl.h>
 #include <windowsx.h>
 #include <winioctl.h>
 #include <dwmapi.h>
@@ -24,6 +25,9 @@
 #pragma comment(lib, "pdh.lib")
 #pragma comment(lib, "wininet.lib")
 #pragma comment(lib, "shell32.lib")
+#pragma comment(lib, "ole32.lib")
+#pragma comment(lib, "oleaut32.lib")
+#pragma comment(lib, "wbemuuid.lib")
 
 // -----------------------------------------------------------------------
 // NVML (NVIDIA Management Library) – dynamic loading, no import lib needed
@@ -143,13 +147,18 @@ static Chart g_charts[NUM_CHARTS]; // 0=CPU, 1=GPU, 2=RAM, 3=Disk
 // Per-core CPU state
 // -----------------------------------------------------------------------
 static const int MAX_CORES = 128;
-static int    g_cpuMode           = 0; // 0=total, 1=logical cores, 2=physical cores
+static int    g_cpuMode           = 0; // 0=total, 1=logical cores, 2=physical cores, 3=load+temp
 static int    g_logicalCoreCount  = 0;
 static int    g_physicalCoreCount = 0;
 static int    g_logicalToPhysical[MAX_CORES] = {}; // logical idx → physical idx
 static Chart  g_logicalCharts[MAX_CORES]     = {};
 static Chart  g_physicalCharts[MAX_CORES]    = {};
 static PDH_HCOUNTER g_pdhCoreCtr = NULL;
+static Chart        g_cpuTempChart  = {};
+static PDH_HCOUNTER g_pdhCpuTempCtr = NULL;
+static volatile LONG g_cpuWmiTempDeciC  = 0;   // tenths of Celsius from WMI thread (0 = N/A)
+static HANDLE        g_cpuTempThread    = NULL;
+static volatile bool g_cpuTempThreadStop = false;
 static D2D1_RECT_F  g_cpuChartRect = {};  // CPU row rect (local coords), for click detection
 
 // -----------------------------------------------------------------------
@@ -259,6 +268,8 @@ static void FlushDisplayValues()
     wcscpy_s(g_gpuVramChart.displayAbsStr, g_gpuVramChart.absStr);
     g_gpuTempChart.displayCurrent = g_gpuTempChart.current;
     wcscpy_s(g_gpuTempChart.displayAbsStr, g_gpuTempChart.absStr);
+    g_cpuTempChart.displayCurrent = g_cpuTempChart.current;
+    wcscpy_s(g_cpuTempChart.displayAbsStr, g_cpuTempChart.absStr);
     for (int i = 0; i < g_diskCount; ++i)
     {
         g_diskCharts[i].displayCurrent = g_diskCharts[i].current;
@@ -766,7 +777,7 @@ static void LoadConfig()
         g_habrRefreshMin = habrMin;
 
     int cpuMode = 0;
-    if (JsonInt(buf, "cpu_mode", &cpuMode) && cpuMode >= 0 && cpuMode <= 2)
+    if (JsonInt(buf, "cpu_mode", &cpuMode) && cpuMode >= 0 && cpuMode <= 3)
         g_cpuMode = cpuMode;
 
     int gpuMode = 0;
@@ -1578,6 +1589,248 @@ static void SampleCores()
 }
 
 // -----------------------------------------------------------------------
+// HWiNFO64 shared memory – CPU temperature reader
+// Requires HWiNFO64 running with "Shared Memory Support" enabled (free feature).
+// -----------------------------------------------------------------------
+#define HWINFO_SM_NAME      "Global\\HWiNFO_SENS_SM2"
+#define HWINFO_SM_SIG       0x53695748u  // 'HWiS'
+#define HWINFO_STR_LEN      128
+#define HWINFO_UNIT_LEN     16
+
+#pragma pack(push, 1)
+struct HWiNFO_HEADER {
+    DWORD    dwSignature;
+    DWORD    dwVersion;
+    DWORD    dwRevision;
+    LONGLONG poll_time;
+    DWORD    dwOffsetOfSensorSection;
+    DWORD    dwSizeOfSensorElement;
+    DWORD    dwNumSensorElements;
+    DWORD    dwOffsetOfReadingSection;
+    DWORD    dwSizeOfReadingElement;
+    DWORD    dwNumReadingElements;
+};
+struct HWiNFO_READING {
+    DWORD  tReading;          // 1 = temperature
+    DWORD  dwSensorIndex;
+    DWORD  dwReadingID;
+    char   szLabelOrig[HWINFO_STR_LEN];
+    char   szLabelUser[HWINFO_STR_LEN];
+    char   szUnit[HWINFO_UNIT_LEN];
+    double Value;
+    double ValueMin;
+    double ValueMax;
+    double ValueAvg;
+};
+#pragma pack(pop)
+
+// Returns CPU temperature in tenths of °C, or 0 if HWiNFO is not running.
+static LONG ReadCpuTempHwInfo()
+{
+    HANDLE hMap = OpenFileMappingA(FILE_MAP_READ, FALSE, HWINFO_SM_NAME);
+    if (!hMap) return 0;
+
+    const void* pView = MapViewOfFile(hMap, FILE_MAP_READ, 0, 0, 0);
+    if (!pView) { CloseHandle(hMap); return 0; }
+
+    LONG result = 0;
+    const auto* hdr = static_cast<const HWiNFO_HEADER*>(pView);
+
+    if (hdr->dwSignature == HWINFO_SM_SIG && hdr->dwNumReadingElements > 0)
+    {
+        const BYTE* base    = static_cast<const BYTE*>(pView);
+        const BYTE* rdBase  = base + hdr->dwOffsetOfReadingSection;
+        DWORD       stride  = hdr->dwSizeOfReadingElement;
+        DWORD       count   = hdr->dwNumReadingElements;
+
+        double bestHi  = 0.0;  // Tctl/Tdie, CPU Package – most specific
+        double bestLo  = 0.0;  // any temp label with "CPU" but not a core/die sub-sensor
+
+        for (DWORD i = 0; i < count; ++i)
+        {
+            const auto* r = reinterpret_cast<const HWiNFO_READING*>(rdBase + i * stride);
+            if (r->tReading != 1) continue;                     // temperature only
+            if (r->Value <= 0.0 || r->Value > 150.0) continue;
+
+            const char* lbl = r->szLabelOrig[0] ? r->szLabelOrig : r->szLabelUser;
+
+            // Skip non-CPU sensors
+            if (strstr(lbl, "GPU"))         continue;
+            if (strstr(lbl, "Motherboard")) continue;
+            if (strstr(lbl, "PCH"))         continue;
+            if (strstr(lbl, "M.2"))         continue;
+            if (strstr(lbl, "Drive"))       continue;
+            if (strstr(lbl, "SSD"))         continue;
+            if (strstr(lbl, "HDD"))         continue;
+            if (strstr(lbl, "NVMe"))        continue;
+
+            // Highest priority: AMD Tctl/Tdie or Intel Package
+            if (strstr(lbl, "Tctl") || strstr(lbl, "Tdie") ||
+                strstr(lbl, "CPU Package") || strcmp(lbl, "CPU") == 0)
+            {
+                if (r->Value > bestHi) bestHi = r->Value;
+            }
+            else if (strstr(lbl, "CPU"))
+            {
+                if (r->Value > bestLo) bestLo = r->Value;
+            }
+        }
+
+        double chosen = bestHi > 0.0 ? bestHi : bestLo;
+        if (chosen > 0.0)
+            result = (LONG)(chosen * 10.0 + 0.5);
+    }
+
+    UnmapViewOfFile(pView);
+    CloseHandle(hMap);
+    return result;
+}
+
+// -----------------------------------------------------------------------
+// WMI CPU temperature background thread.
+// Priority order each tick:
+//   1. HWiNFO64 shared memory   – best AMD support, instant read
+//   2. OpenHardwareMonitor WMI  – fallback if OHM is running
+//   3. LibreHardwareMonitor WMI – fallback if LHM is running
+//   4. MSAcpi_ThermalZoneTemperature – Intel / some AMD laptops
+// -----------------------------------------------------------------------
+
+// Connect to a WMI namespace; returns nullptr on failure (caller must Release).
+static IWbemServices* WmiConnect(IWbemLocator* pLoc, const wchar_t* ns)
+{
+    IWbemServices* pSvc = nullptr;
+    BSTR bns = SysAllocString(ns);
+    HRESULT hr = pLoc->ConnectServer(bns, nullptr, nullptr, nullptr,
+                                     0, nullptr, nullptr, &pSvc);
+    SysFreeString(bns);
+    if (FAILED(hr)) return nullptr;
+    CoSetProxyBlanket(pSvc, RPC_C_AUTHN_WINNT, RPC_C_AUTHZ_NONE, nullptr,
+                      RPC_C_AUTHN_LEVEL_CALL, RPC_C_IMP_LEVEL_IMPERSONATE,
+                      nullptr, EOAC_NONE);
+    return pSvc;
+}
+
+// Query an OHM/LHM Sensor table for CPU temperature; returns tenths of °C or 0.
+static LONG WmiQueryHwMon(IWbemServices* pSvc)
+{
+    if (!pSvc) return 0;
+    BSTR wql   = SysAllocString(L"WQL");
+    BSTR query = SysAllocString(
+        L"SELECT Value FROM Sensor WHERE SensorType='Temperature' AND "
+        L"(Name='CPU Package' OR Name='Core (Tdie)' OR Name='Core Average' OR "
+        L"Name='CPU' OR Name='Core Max')");
+
+    LONG result = 0;
+    IEnumWbemClassObject* pEnum = nullptr;
+    if (SUCCEEDED(pSvc->ExecQuery(wql, query,
+            WBEM_FLAG_FORWARD_ONLY | WBEM_FLAG_RETURN_IMMEDIATELY,
+            nullptr, &pEnum)))
+    {
+        IWbemClassObject* pObj = nullptr; ULONG ret = 0;
+        float best = 0.0f;
+        while (pEnum->Next(WBEM_INFINITE, 1, &pObj, &ret) == S_OK)
+        {
+            VARIANT vt; VariantInit(&vt);
+            if (SUCCEEDED(pObj->Get(L"Value", 0, &vt, nullptr, nullptr)))
+            {
+                float v = (vt.vt == VT_R4) ? vt.fltVal :
+                          (vt.vt == VT_R8) ? (float)vt.dblVal : 0.0f;
+                if (v > best) best = v;
+            }
+            VariantClear(&vt); pObj->Release();
+        }
+        pEnum->Release();
+        if (best > 0.0f) result = (LONG)(best * 10.0f + 0.5f);
+    }
+    SysFreeString(query); SysFreeString(wql);
+    return result;
+}
+
+// Query MSAcpi_ThermalZoneTemperature; returns tenths of °C or 0.
+static LONG WmiQueryAcpi(IWbemServices* pSvc)
+{
+    if (!pSvc) return 0;
+    BSTR wql   = SysAllocString(L"WQL");
+    BSTR query = SysAllocString(L"SELECT * FROM MSAcpi_ThermalZoneTemperature");
+
+    LONG result = 0;
+    IEnumWbemClassObject* pEnum = nullptr;
+    if (SUCCEEDED(pSvc->ExecQuery(wql, query,
+            WBEM_FLAG_FORWARD_ONLY | WBEM_FLAG_RETURN_IMMEDIATELY,
+            nullptr, &pEnum)))
+    {
+        IWbemClassObject* pObj = nullptr; ULONG ret = 0;
+        LONG maxDeciK = 0;
+        while (pEnum->Next(WBEM_INFINITE, 1, &pObj, &ret) == S_OK)
+        {
+            VARIANT vt; VariantInit(&vt);
+            if (SUCCEEDED(pObj->Get(L"CurrentTemperature", 0, &vt, nullptr, nullptr)))
+            {
+                LONG val = (vt.vt == VT_I4)  ? vt.lVal :
+                           (vt.vt == VT_UI4) ? (LONG)vt.ulVal : 0;
+                if (val > maxDeciK) maxDeciK = val;
+            }
+            VariantClear(&vt); pObj->Release();
+        }
+        pEnum->Release();
+        if (maxDeciK > 2731) result = maxDeciK - 2731; // tenths K → tenths °C
+    }
+    SysFreeString(query); SysFreeString(wql);
+    return result;
+}
+
+static DWORD WINAPI CpuTempThreadProc(LPVOID)
+{
+    CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED);
+    CoInitializeSecurity(nullptr, -1, nullptr, nullptr,
+        RPC_C_AUTHN_LEVEL_DEFAULT, RPC_C_IMP_LEVEL_IMPERSONATE,
+        nullptr, EOAC_NONE, nullptr);
+
+    IWbemLocator* pLoc = nullptr;
+    CoCreateInstance(CLSID_WbemLocator, nullptr, CLSCTX_INPROC_SERVER,
+                     IID_IWbemLocator, (void**)&pLoc);
+
+    // Pre-connect WMI namespaces (best-effort; nullptr if unavailable)
+    IWbemServices* pOhm  = pLoc ? WmiConnect(pLoc, L"root\\OpenHardwareMonitor")  : nullptr;
+    IWbemServices* pLhm  = pLoc ? WmiConnect(pLoc, L"root\\LibreHardwareMonitor") : nullptr;
+    IWbemServices* pAcpi = pLoc ? WmiConnect(pLoc, L"root\\wmi")                  : nullptr;
+
+    while (!g_cpuTempThreadStop)
+    {
+        LONG val = 0;
+
+        // 1. HWiNFO64 shared memory (best for AMD Ryzen, no driver required)
+        if (!val) val = ReadCpuTempHwInfo();
+        // 2. OpenHardwareMonitor WMI
+        if (!val) val = WmiQueryHwMon(pOhm);
+        // 3. LibreHardwareMonitor WMI
+        if (!val) val = WmiQueryHwMon(pLhm);
+        // 4. ACPI thermal zone (Intel / some AMD laptops)
+        if (!val) val = WmiQueryAcpi(pAcpi);
+
+        if (val > 0)
+            InterlockedExchange(&g_cpuWmiTempDeciC, val);
+
+        for (int i = 0; i < 40 && !g_cpuTempThreadStop; ++i)
+            Sleep(50);
+    }
+
+    if (pOhm)  pOhm->Release();
+    if (pLhm)  pLhm->Release();
+    if (pAcpi) pAcpi->Release();
+    if (pLoc)  pLoc->Release();
+    CoUninitialize();
+    return 0;
+}
+
+static void StartCpuTempThread()
+{
+    g_cpuTempThreadStop = false;
+    if (g_cpuTempThread) { CloseHandle(g_cpuTempThread); g_cpuTempThread = NULL; }
+    g_cpuTempThread = CreateThread(nullptr, 0, CpuTempThreadProc, nullptr, 0, nullptr);
+}
+
+// -----------------------------------------------------------------------
 // Sample all four metrics into charts
 // -----------------------------------------------------------------------
 static void SampleMetrics()
@@ -1611,6 +1864,59 @@ static void SampleMetrics()
                 double actualMHz = freq.doubleValue * perf.doubleValue / 100.0;
                 swprintf_s(g_charts[0].absStr, L"%.2f GHz", actualMHz / 1000.0);
             }
+        }
+    }
+
+    // CPU temperature – prefer WMI thread result (OHM/LHM/ACPI), fall back to PDH Thermal Zone
+    {
+        double tempC  = 0.0;
+        bool gotTemp  = false;
+
+        // Primary: WMI background thread (OHM → LHM → MSAcpi); value is tenths of °C
+        LONG deciC = InterlockedCompareExchange(&g_cpuWmiTempDeciC, 0, 0);
+        if (deciC > 0)
+        {
+            tempC   = deciC / 10.0;
+            gotTemp = true;
+        }
+
+        // Fallback: PDH Thermal Zone counter (works on some Intel platforms)
+        if (!gotTemp && g_pdhCpuTempCtr)
+        {
+            DWORD sz = 0, cnt = 0;
+            PdhGetFormattedCounterArrayW(g_pdhCpuTempCtr, PDH_FMT_DOUBLE,
+                                         &sz, &cnt, nullptr);
+            if (sz > 0)
+            {
+                auto* items = (PDH_FMT_COUNTERVALUE_ITEM_W*)malloc(sz);
+                if (items)
+                {
+                    if (PdhGetFormattedCounterArrayW(g_pdhCpuTempCtr, PDH_FMT_DOUBLE,
+                            &sz, &cnt, items) == ERROR_SUCCESS)
+                    {
+                        double maxT = 0.0;
+                        for (DWORD i = 0; i < cnt; ++i)
+                            if (items[i].FmtValue.CStatus == PDH_CSTATUS_VALID_DATA)
+                            {
+                                double t = items[i].FmtValue.doubleValue / 10.0 - 273.15;
+                                if (t > maxT) { maxT = t; gotTemp = true; }
+                            }
+                        tempC = maxT;
+                    }
+                    free(items);
+                }
+            }
+        }
+
+        if (gotTemp && tempC > 0.0)
+        {
+            PushChartValue(g_cpuTempChart, max(0.0, min(tempC / 100.0, 1.0)));
+            swprintf_s(g_cpuTempChart.absStr, L"%.0f\u00B0C", tempC);
+        }
+        else
+        {
+            PushChartValue(g_cpuTempChart, 0.0);
+            wcscpy_s(g_cpuTempChart.absStr, L"N/A");
         }
     }
 
@@ -2194,30 +2500,56 @@ static void UpdateLayeredContent(HWND hwnd)
 
                 if (i == 0 && g_cpuMode != 0)
                 {
-                    const float titleH = g_fontSize * 1.4f;
-                    const float margin = 8.f;
+                    if (g_cpuMode == 3)
                     {
-                        ID2D1SolidColorBrush* pBrush = nullptr;
-                        if (SUCCEEDED(g_pDCRT->CreateSolidColorBrush(
-                                D2D1::ColorF(0.f, 0.f, 0.f, 1.f), &pBrush)))
+                        // Load + Temp side by side
+                        const float titleH = g_fontSize * 1.4f;
+                        const float margin = 8.f;
                         {
-                            D2D1_RECT_F titleRect = { x + margin, y, x + colW - margin, y + titleH };
-                            DrawTextEllipsis(g_pDCRT, g_charts[0].name,
-                                             (UINT32)wcslen(g_charts[0].name),
-                                             g_pChartFmtL, titleRect, pBrush);
-                            pBrush->Release();
+                            ID2D1SolidColorBrush* pBrush = nullptr;
+                            if (SUCCEEDED(g_pDCRT->CreateSolidColorBrush(
+                                    D2D1::ColorF(0.f, 0.f, 0.f, 1.f), &pBrush)))
+                            {
+                                D2D1_RECT_F titleRect = { x + margin, y, x + colW - margin, y + titleH };
+                                DrawTextEllipsis(g_pDCRT, g_charts[0].name,
+                                                 (UINT32)wcslen(g_charts[0].name),
+                                                 g_pChartFmtL, titleRect, pBrush);
+                                pBrush->Release();
+                            }
                         }
+                        float halfW  = colW / 2.f;
+                        float chartY = y + titleH;
+                        int miniSamples = max(2, CHART_SAMPLES / 2);
+                        DrawChart(g_pDCRT, g_charts[0],    { x,         chartY, x + halfW, y + rowH }, nullptr, g_pChartFmtR, miniSamples);
+                        DrawChart(g_pDCRT, g_cpuTempChart, { x + halfW, chartY, x + colW,  y + rowH }, nullptr, g_pChartFmtR, miniSamples);
                     }
-                    const Chart* cores = (g_cpuMode == 1) ? g_logicalCharts  : g_physicalCharts;
-                    int coreCount      = (g_cpuMode == 1) ? g_logicalCoreCount : g_physicalCoreCount;
-                    if (coreCount < 1) coreCount = 1;
-                    int miniSamples = max(2, CHART_SAMPLES / coreCount);
-                    float miniW  = colW / (float)coreCount;
-                    float chartY = y + titleH;
-                    for (int c = 0; c < coreCount; c++)
+                    else
                     {
-                        D2D1_RECT_F mini = { x + c * miniW, chartY, x + (c + 1) * miniW, y + rowH };
-                        DrawChart(g_pDCRT, cores[c], mini, g_pChartFmtL, g_pChartFmtR, miniSamples);
+                        const float titleH = g_fontSize * 1.4f;
+                        const float margin = 8.f;
+                        {
+                            ID2D1SolidColorBrush* pBrush = nullptr;
+                            if (SUCCEEDED(g_pDCRT->CreateSolidColorBrush(
+                                    D2D1::ColorF(0.f, 0.f, 0.f, 1.f), &pBrush)))
+                            {
+                                D2D1_RECT_F titleRect = { x + margin, y, x + colW - margin, y + titleH };
+                                DrawTextEllipsis(g_pDCRT, g_charts[0].name,
+                                                 (UINT32)wcslen(g_charts[0].name),
+                                                 g_pChartFmtL, titleRect, pBrush);
+                                pBrush->Release();
+                            }
+                        }
+                        const Chart* cores = (g_cpuMode == 1) ? g_logicalCharts  : g_physicalCharts;
+                        int coreCount      = (g_cpuMode == 1) ? g_logicalCoreCount : g_physicalCoreCount;
+                        if (coreCount < 1) coreCount = 1;
+                        int miniSamples = max(2, CHART_SAMPLES / coreCount);
+                        float miniW  = colW / (float)coreCount;
+                        float chartY = y + titleH;
+                        for (int c = 0; c < coreCount; c++)
+                        {
+                            D2D1_RECT_F mini = { x + c * miniW, chartY, x + (c + 1) * miniW, y + rowH };
+                            DrawChart(g_pDCRT, cores[c], mini, g_pChartFmtL, g_pChartFmtR, miniSamples);
+                        }
                     }
                 }
                 else if (i == 1 && g_gpuMode != 0)
@@ -2396,6 +2728,9 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
             swprintf_s(g_gpuTempChart.name, L"%s Temp", gpuBuf);
         }
 
+        // CPU temperature chart name
+        swprintf_s(g_cpuTempChart.name, L"%s Temp", g_charts[0].name);
+
         DetectCoreTopology();
 
         if (PdhOpenQuery(NULL, 0, &g_pdhQuery) == ERROR_SUCCESS)
@@ -2425,6 +2760,10 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
             PdhAddEnglishCounterW(g_pdhQuery,
                 L"\\GPU Engine(*)\\Temperature",
                 0, &g_pdhGpuTempCtr);
+            // CPU temperature via Thermal Zone (best-effort; values are in tenths of Kelvin)
+            PdhAddEnglishCounterW(g_pdhQuery,
+                L"\\Thermal Zone Information(*)\\Temperature",
+                0, &g_pdhCpuTempCtr);
             // Per-disk counters (enumerate instances first)
             EnumerateDisks();
             // Clamp restored disk mode to valid range
@@ -2523,9 +2862,10 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
                 g_dividerX2 = g_dividerX + ((float)w - g_dividerX) * 0.60f;
         }
 
-        // Config already loaded in WinMain; kick weather and Habr fetches
+        // Config already loaded in WinMain; kick weather, Habr, and CPU temp fetches
         StartWeatherFetch();
         StartHabrFetch();
+        StartCpuTempThread();
 
         SetTimer(hwnd, 1, 50, nullptr);                           // ~20 fps chart update
         SetTimer(hwnd, 2, 600000, nullptr);                        // weather refresh every 10 min
@@ -2689,9 +3029,9 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
         else if ((float)mx >= g_cpuChartRect.left && (float)mx <= g_cpuChartRect.right &&
                  (float)my >= g_cpuChartRect.top  && (float)my <= g_cpuChartRect.bottom)
         {
-            // Cycle CPU mode: 0 (total) → 1 (logical) → 2 (physical, if SMT) → 0
+            // Cycle CPU mode: 0 (total) → 1 (logical) → 2 (physical, if SMT) → 3 (load+temp) → 0
             int maxMode = (g_physicalCoreCount > 0 &&
-                           g_physicalCoreCount != g_logicalCoreCount) ? 2 : 1;
+                           g_physicalCoreCount != g_logicalCoreCount) ? 3 : 2;
             g_cpuMode = (g_cpuMode + 1) % (maxMode + 1);
             SaveWindowState(hwnd);
             UpdateLayeredContent(hwnd);
@@ -2979,6 +3319,13 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
             WaitForSingleObject(g_habrThread, 2000);
             CloseHandle(g_habrThread);
             g_habrThread = NULL;
+        }
+        g_cpuTempThreadStop = true;
+        if (g_cpuTempThread)
+        {
+            WaitForSingleObject(g_cpuTempThread, 3000);
+            CloseHandle(g_cpuTempThread);
+            g_cpuTempThread = NULL;
         }
         DeleteCriticalSection(&g_weatherCS);
         DeleteCriticalSection(&g_habrCS);
