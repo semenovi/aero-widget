@@ -3,14 +3,10 @@ build/
 out/
 cmake-build-*/
 
-# Visual Studio
+# Visual Studio — user-specific and generated files only
 .vs/
-*.vcxproj
-*.vcxproj.filters
 *.vcxproj.user
-*.sln
 *.suo
-*.user
 *.userosscache
 *.sln.docstates
 
