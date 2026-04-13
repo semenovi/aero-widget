@@ -112,9 +112,9 @@ static void ApplyBlur(HWND hwnd)
 // -----------------------------------------------------------------------
 // Layout constants
 // -----------------------------------------------------------------------
-static const float FONT_SCALE = 1.5f;
-static const float PAD        = 6.f  * FONT_SCALE;
-static const float VEDGE      = 14.f * FONT_SCALE;
+static float g_fontScale = 1.5f;          // configurable via config.json "font_scale"
+static float PAD         = 6.f  * g_fontScale;
+static float VEDGE       = 14.f * g_fontScale;
 
 // -----------------------------------------------------------------------
 // D2D / DirectWrite state
@@ -125,7 +125,7 @@ static IDWriteTextFormat*   g_pChartFmtL  = nullptr;   // left/top  – chart na
 static IDWriteTextFormat*   g_pChartFmtR  = nullptr;   // right/top – chart value
 static ID2D1DCRenderTarget* g_pDCRT       = nullptr;
 static IDWriteTextFormat*   g_pMonoFmt    = nullptr;   // monospace – ASCII art
-static float                g_fontSize    = 14.f * FONT_SCALE;
+static float                g_fontSize    = 14.f * g_fontScale;
 
 // -----------------------------------------------------------------------
 // Chart
@@ -687,11 +687,13 @@ static void SaveWindowState(HWND hwnd)
         "    \"cpu_mode\": %d,\n"
         "    \"gpu_mode\": %d,\n"
         "    \"disk_mode\": %d,\n"
+        "    \"font_scale\": %.2f,\n"
         "    \"autostart\": %s\n"
         "}\n",
         escaped, monL, monT, relX, relY, winW, winH,
         (double)g_dividerX, (double)g_dividerY, (double)g_dividerX2,
         g_cpuMode, g_gpuMode, g_diskMode,
+        (double)g_fontScale,
         g_autostart ? "true" : "false");
     fclose(f);
 }
@@ -836,6 +838,15 @@ static void LoadConfig()
             g_autostart = (strncmp(p, "true", 4) == 0);
         }
     }
+    double fontScale = 0.0;
+    if (JsonDouble(buf, "font_scale", &fontScale) && fontScale > 0.0)
+    {
+        g_fontScale = (float)fontScale;
+        PAD         = 6.f  * g_fontScale;
+        VEDGE       = 14.f * g_fontScale;
+        g_fontSize  = 14.f * g_fontScale;
+    }
+
     ApplyAutostart();
 }
 
