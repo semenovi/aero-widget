@@ -30,7 +30,8 @@
 #pragma comment(lib, "wbemuuid.lib")
 
 #define WM_TRAYICON  (WM_APP + 1)
-#define ID_TRAY_EXIT 1001
+#define ID_TRAY_EXIT      1001
+#define ID_TRAY_AUTOSTART 1002
 static NOTIFYICONDATAW g_nid = {};
 
 // -----------------------------------------------------------------------
@@ -2961,12 +2962,22 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
             POINT pt;
             GetCursorPos(&pt);
             HMENU hMenu = CreatePopupMenu();
+            AppendMenuW(hMenu,
+                        MF_STRING | (g_autostart ? MF_CHECKED : MF_UNCHECKED),
+                        ID_TRAY_AUTOSTART, L"Autostart");
+            AppendMenuW(hMenu, MF_SEPARATOR, 0, NULL);
             AppendMenuW(hMenu, MF_STRING, ID_TRAY_EXIT, L"Exit");
             SetForegroundWindow(hwnd);
             int cmd = TrackPopupMenu(hMenu, TPM_RETURNCMD | TPM_RIGHTBUTTON,
                                      pt.x, pt.y, 0, hwnd, NULL);
             DestroyMenu(hMenu);
-            if (cmd == ID_TRAY_EXIT)
+            if (cmd == ID_TRAY_AUTOSTART)
+            {
+                g_autostart = !g_autostart;
+                ApplyAutostart();
+                SaveWindowState(hwnd);
+            }
+            else if (cmd == ID_TRAY_EXIT)
                 DestroyWindow(hwnd);
         }
         return 0;
