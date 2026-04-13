@@ -2732,7 +2732,7 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
         SystemParametersInfoW(SPI_GETNONCLIENTMETRICS, sizeof(ncm), &ncm, 0);
         HDC hdc    = GetDC(hwnd);
         float dpi  = static_cast<float>(GetDeviceCaps(hdc, LOGPIXELSY));
-        g_fontSize = static_cast<float>(abs(ncm.lfMessageFont.lfHeight)) * 96.f / dpi * FONT_SCALE;
+        g_fontSize = static_cast<float>(abs(ncm.lfMessageFont.lfHeight)) * 96.f / dpi * g_fontScale;
         ReleaseDC(hwnd, hdc);
 
         g_pDWFactory->CreateTextFormat(
