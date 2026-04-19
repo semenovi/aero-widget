@@ -1369,7 +1369,7 @@ static void DrawWeather(ID2D1RenderTarget* rt, const WeatherData& wd, D2D1_RECT_
     {
         for (int j = 0; j < 5; j++)
         {
-            if (!wd.ascii[j][0]) continue;
+            if (!wd.ascii[j][0]) { y += lhMono; continue; }
             if (y + lhMono > area.bottom) break;
             D2D1_RECT_F r = { area.left, y, area.right, y + lhMono };
             DrawTextEllipsis(rt, wd.ascii[j], (UINT32)wcslen(wd.ascii[j]),
@@ -1377,6 +1377,10 @@ static void DrawWeather(ID2D1RenderTarget* rt, const WeatherData& wd, D2D1_RECT_
             y += lhMono;
         }
         y += lh * 0.3f;
+    }
+    else
+    {
+        y += lhMono * 5 + lh * 0.3f;
     }
 
     auto drawLine = [&](const wchar_t* text)
