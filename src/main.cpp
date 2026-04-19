@@ -190,7 +190,8 @@ static int          g_diskCount = 0;
 static Chart        g_diskCharts[MAX_DISKS]     = {};
 static PDH_HCOUNTER g_pdhDiskCtrs[MAX_DISKS]    = {};
 static PDH_HCOUNTER g_pdhDiskByteCtrs[MAX_DISKS] = {};
-static D2D1_RECT_F  g_diskChartRect = {};
+static D2D1_RECT_F  g_diskChartRect  = {};
+static D2D1_RECT_F  g_weatherRect    = {};
 
 // -----------------------------------------------------------------------
 // Per-process top lists
@@ -1355,6 +1356,7 @@ static void StartWeatherFetch()
 // -----------------------------------------------------------------------
 static void DrawWeather(ID2D1RenderTarget* rt, const WeatherData& wd, D2D1_RECT_F area)
 {
+    g_weatherRect = area;
     if (!wd.valid || !g_pChartFmtL) return;
 
     ID2D1SolidColorBrush* pBrush = nullptr;
@@ -3183,6 +3185,11 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
                 SaveWindowState(hwnd);
                 UpdateLayeredContent(hwnd);
             }
+        }
+        else if ((float)mx >= g_weatherRect.left && (float)mx <= g_weatherRect.right &&
+                 (float)my >= g_weatherRect.top  && (float)my <= g_weatherRect.bottom)
+        {
+            StartWeatherFetch();
         }
         else
         {
