@@ -1299,14 +1299,32 @@ static DWORD WINAPI WeatherThreadProc(LPVOID)
                 int len = (int)(le - lp);
                 if (len > 0 && lp[len - 1] == '\r') len--;
 
+                // Strip ANSI escape sequences (e.g. \033[38;5;240;1m) that
+                // wttr.in sometimes emits even when ?T is requested.
+                char stripped[256] = {};
+                int slen = 0;
+                for (int i = 0; i < len && slen < 255; i++)
+                {
+                    if ((unsigned char)lp[i] == 0x1B && i + 1 < len && lp[i + 1] == '[')
+                    {
+                        i += 2;
+                        while (i < len && !((lp[i] >= 'A' && lp[i] <= 'Z') || (lp[i] >= 'a' && lp[i] <= 'z')))
+                            i++;
+                    }
+                    else
+                    {
+                        stripped[slen++] = lp[i];
+                    }
+                }
+
                 // wttr.in ASCII art lines always start with a space.
                 // Skip lines that don't (e.g. site-name headers like "wttr.in").
-                bool hasContent = (len > 0 && lp[0] == ' ');
+                bool hasContent = (slen > 0 && stripped[0] == ' ');
 
                 if (hasContent)
                 {
-                    if (len > 71) len = 71;
-                    int wlen = MultiByteToWideChar(CP_UTF8, 0, lp, len,
+                    if (slen > 71) slen = 71;
+                    int wlen = MultiByteToWideChar(CP_UTF8, 0, stripped, slen,
                                                    wd.ascii[lineIdx], 72);
                     if (wlen > 0) wd.ascii[lineIdx][wlen] = L'\0';
                     lineIdx++;
