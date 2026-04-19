@@ -3208,10 +3208,25 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
         return 0;
     }
 
+    case WM_MOUSELEAVE:
+    {
+        if (g_habrHover >= 0)
+        {
+            g_habrHover = -1;
+            UpdateLayeredContent(hwnd);
+        }
+        g_hoveredProcList = -1;
+        g_hoveredProcRow  = -1;
+        break;
+    }
+
     case WM_MOUSEMOVE:
     {
         int mx = GET_X_LPARAM(lParam);
         int my = GET_Y_LPARAM(lParam);
+
+        TRACKMOUSEEVENT tme = { sizeof(tme), TME_LEAVE, hwnd, 0 };
+        TrackMouseEvent(&tme);
         RECT rc; GetWindowRect(hwnd, &rc);
 
         if (g_draggingDiv)
