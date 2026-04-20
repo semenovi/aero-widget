@@ -533,6 +533,7 @@ static int              g_habrCount      = 0;
 static CRITICAL_SECTION g_habrCS;
 static HANDLE           g_habrThread     = NULL;
 static int              g_habrRefreshMin = 5; // configurable via config.json
+static char             g_rssFeedUrl[1024] = "https://habr.com/ru/rss/all/all/";
 
 // Link hover/click state (main-thread only, written by DrawHabrPanel)
 static D2D1_RECT_F g_habrRects[MAX_HABR] = {};
@@ -613,7 +614,7 @@ static void SaveDefaultConfig()
     FILE* f = nullptr;
     if (_wfopen_s(&f, path, L"w") == 0 && f)
     {
-        fputs("{\n    \"location\": \"\",\n    \"autostart\": false\n}\n", f);
+        fputs("{\n    \"location\": \"\",\n    \"autostart\": false,\n    \"rss_feed_url\": \"https://habr.com/ru/rss/all/all/\"\n}\n", f);
         fclose(f);
     }
 }
@@ -669,6 +670,14 @@ static void SaveWindowState(HWND hwnd)
         escaped[j++] = g_location[i];
     }
 
+    char escapedRss[1024] = {};
+    for (int i = 0, j = 0; g_rssFeedUrl[i] && j < (int)sizeof(escapedRss) - 3; i++)
+    {
+        if (g_rssFeedUrl[i] == '"' || g_rssFeedUrl[i] == '\\')
+            escapedRss[j++] = '\\';
+        escapedRss[j++] = g_rssFeedUrl[i];
+    }
+
     wchar_t path[MAX_PATH];
     GetConfigPath(path, MAX_PATH);
     FILE* f = nullptr;
@@ -690,13 +699,15 @@ static void SaveWindowState(HWND hwnd)
         "    \"gpu_mode\": %d,\n"
         "    \"disk_mode\": %d,\n"
         "    \"font_scale\": %.2f,\n"
-        "    \"autostart\": %s\n"
+        "    \"autostart\": %s,\n"
+        "    \"rss_feed_url\": \"%s\"\n"
         "}\n",
         escaped, monL, monT, relX, relY, winW, winH,
         (double)g_dividerX, (double)g_dividerY, (double)g_dividerX2,
         g_cpuMode, g_gpuMode, g_diskMode,
         (double)g_fontScale,
-        g_autostart ? "true" : "false");
+        g_autostart ? "true" : "false",
+        escapedRss);
     fclose(f);
 }
 
@@ -817,6 +828,36 @@ static void LoadConfig()
     int habrMin = 0;
     if (JsonInt(buf, "habr_refresh_minutes", &habrMin) && habrMin > 0)
         g_habrRefreshMin = habrMin;
+
+    {
+        char rssUrl[1024] = {};
+        if (JsonStr(buf, "rss_feed_url", 0, rssUrl, sizeof(rssUrl)) && rssUrl[0])
+            strncpy_s(g_rssFeedUrl, rssUrl, _TRUNCATE);
+        else
+        {
+            // Field missing — patch the file by inserting before the closing '}'
+            FILE* fw = nullptr;
+            if (_wfopen_s(&fw, path, L"w") == 0 && fw)
+            {
+                int len = (int)strlen(buf);
+                int last = len - 1;
+                while (last >= 0 && (buf[last] == '\n' || buf[last] == '\r' ||
+                                      buf[last] == ' '  || buf[last] == '\t')) last--;
+                if (last >= 0 && buf[last] == '}')
+                {
+                    buf[last] = '\0';
+                    int end = last - 1;
+                    while (end >= 0 && (buf[end] == ' ' || buf[end] == '\n' ||
+                                         buf[end] == '\r' || buf[end] == '\t')) end--;
+                    buf[end + 1] = '\0';
+                    fprintf(fw, "%s,\n    \"rss_feed_url\": \"%s\"\n}\n", buf, g_rssFeedUrl);
+                }
+                else
+                    fputs(buf, fw);
+                fclose(fw);
+            }
+        }
+    }
 
     int cpuMode = 0;
     if (JsonInt(buf, "cpu_mode", &cpuMode) && cpuMode >= 0 && cpuMode <= 3)
@@ -1060,7 +1101,9 @@ static bool XmlTag(const char* begin, const char* end,
 // -----------------------------------------------------------------------
 static DWORD WINAPI HabrThreadProc(LPVOID)
 {
-    char* body = HttpGetUrl(L"https://habr.com/ru/rss/all/all/");
+    wchar_t wFeedUrl[1024];
+    MultiByteToWideChar(CP_UTF8, 0, g_rssFeedUrl, -1, wFeedUrl, 1024);
+    char* body = HttpGetUrl(wFeedUrl);
     if (!body) return 0;
 
     HabrArticle* articles = new HabrArticle[MAX_HABR]();
