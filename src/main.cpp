@@ -700,14 +700,22 @@ static void SaveWindowState(HWND hwnd)
         "    \"disk_mode\": %d,\n"
         "    \"font_scale\": %.2f,\n"
         "    \"autostart\": %s,\n"
-        "    \"rss_feed_url\": \"%s\"\n"
+        "    \"rss_feed_url\": \"%s\",\n"
+        "    \"proc_abs_cpu\": %d,\n"
+        "    \"proc_abs_gpu\": %d,\n"
+        "    \"proc_abs_ram\": %d,\n"
+        "    \"proc_abs_disk\": %d\n"
         "}\n",
         escaped, monL, monT, relX, relY, winW, winH,
         (double)g_dividerX, (double)g_dividerY, (double)g_dividerX2,
         g_cpuMode, g_gpuMode, g_diskMode,
         (double)g_fontScale,
         g_autostart ? "true" : "false",
-        escapedRss);
+        escapedRss,
+        g_procAbsMode[0] ? 1 : 0,
+        g_procAbsMode[1] ? 1 : 0,
+        g_procAbsMode[2] ? 1 : 0,
+        g_procAbsMode[3] ? 1 : 0);
     fclose(f);
 }
 
@@ -870,6 +878,18 @@ static void LoadConfig()
     int diskMode = 0;
     if (JsonInt(buf, "disk_mode", &diskMode) && diskMode >= 0)
         g_diskMode = diskMode; // validated against g_diskCount after enumeration
+
+    {
+        static const char* procAbsKeys[NUM_CHARTS] = {
+            "proc_abs_cpu", "proc_abs_gpu", "proc_abs_ram", "proc_abs_disk"
+        };
+        for (int i = 0; i < NUM_CHARTS; i++)
+        {
+            int v = 0;
+            if (JsonInt(buf, procAbsKeys[i], &v))
+                g_procAbsMode[i] = (v != 0);
+        }
+    }
 
     // autostart: look for "true" literal after the key
     {
@@ -3243,6 +3263,7 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
                     (float)my >= g_procListRects[i].top   && (float)my <= g_procListRects[i].bottom)
                 {
                     g_procAbsMode[i] = !g_procAbsMode[i];
+                    SaveWindowState(hwnd);
                     UpdateLayeredContent(hwnd);
                     break;
                 }
