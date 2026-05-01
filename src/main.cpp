@@ -175,6 +175,13 @@ static Chart        g_gpuTempChart  = {};
 static PDH_HCOUNTER g_pdhGpuTempCtr = NULL;
 static D2D1_RECT_F  g_gpuChartRect  = {};
 
+// -----------------------------------------------------------------------
+// RAM mode
+// -----------------------------------------------------------------------
+static int         g_ramMode      = 0; // 0=load, 1=load+temp
+static Chart       g_ramTempChart = {};
+static D2D1_RECT_F g_ramChartRect = {};
+
 // NVML state (prefer over PDH for GPU temperature)
 static HMODULE                        g_hNvml         = NULL;
 static nvmlDevice_t                   g_nvmlDevice    = NULL;
@@ -265,6 +272,7 @@ static void FlushDisplayValues()
     flush(g_gpuVramChart);
     flush(g_gpuTempChart);
     flush(g_cpuTempChart);
+    flush(g_ramTempChart);
     for (int i = 0; i < g_diskCount; ++i)        flush(g_diskCharts[i]);
 
     // Sample and flush process lists at the same rate as chart labels.
@@ -681,6 +689,7 @@ static void SaveWindowState(HWND hwnd)
         "    \"divider_x2\": %.2f,\n"
         "    \"cpu_mode\": %d,\n"
         "    \"gpu_mode\": %d,\n"
+        "    \"ram_mode\": %d,\n"
         "    \"disk_mode\": %d,\n"
         "    \"font_scale\": %.2f,\n"
         "    \"autostart\": %s,\n"
@@ -692,7 +701,7 @@ static void SaveWindowState(HWND hwnd)
         "}\n",
         escaped, monL, monT, relX, relY, winW, winH,
         (double)g_dividerX, (double)g_dividerY, (double)g_dividerX2,
-        g_cpuMode, g_gpuMode, g_diskMode,
+        g_cpuMode, g_gpuMode, g_ramMode, g_diskMode,
         (double)g_fontScale,
         g_autostart ? "true" : "false",
         escapedRss,
@@ -858,6 +867,10 @@ static void LoadConfig()
     int gpuMode = 0;
     if (JsonInt(buf, "gpu_mode", &gpuMode) && gpuMode >= 0 && gpuMode <= 4)
         g_gpuMode = gpuMode;
+
+    int ramMode = 0;
+    if (JsonInt(buf, "ram_mode", &ramMode) && ramMode >= 0 && ramMode <= 1)
+        g_ramMode = ramMode;
 
     int diskMode = 0;
     if (JsonInt(buf, "disk_mode", &diskMode) && diskMode >= 0)
@@ -1504,7 +1517,82 @@ static void GetRamName(wchar_t* buf, int len)
     MEMORYSTATUSEX ms = { sizeof(ms) };
     GlobalMemoryStatusEx(&ms);
     ULONGLONG gb = (ms.ullTotalPhys + ((1ULL << 30) - 1)) >> 30;
-    swprintf_s(buf, len, L"RAM (%llu GB)", gb);
+
+    wchar_t partBuf[128] = {};
+    DWORD   speed        = 0;
+
+    HRESULT hrCom = CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED);
+    IWbemLocator* pLoc = nullptr;
+    if (SUCCEEDED(CoCreateInstance(CLSID_WbemLocator, nullptr, CLSCTX_INPROC_SERVER,
+                                   IID_IWbemLocator, (void**)&pLoc)))
+    {
+        IWbemServices* pSvc = nullptr;
+        BSTR bns = SysAllocString(L"root\\cimv2");
+        if (SUCCEEDED(pLoc->ConnectServer(bns, nullptr, nullptr, nullptr,
+                                          0, nullptr, nullptr, &pSvc)))
+        {
+            CoSetProxyBlanket(pSvc, RPC_C_AUTHN_WINNT, RPC_C_AUTHZ_NONE,
+                nullptr, RPC_C_AUTHN_LEVEL_CALL, RPC_C_IMP_LEVEL_IMPERSONATE,
+                nullptr, EOAC_NONE);
+
+            BSTR wql   = SysAllocString(L"WQL");
+            BSTR query = SysAllocString(
+                L"SELECT PartNumber,ConfiguredClockSpeed,Speed FROM Win32_PhysicalMemory");
+            IEnumWbemClassObject* pEnum = nullptr;
+            if (SUCCEEDED(pSvc->ExecQuery(wql, query,
+                                          WBEM_FLAG_FORWARD_ONLY, nullptr, &pEnum)))
+            {
+                IWbemClassObject* pObj = nullptr; ULONG ret = 0;
+                while (pEnum->Next(WBEM_INFINITE, 1, &pObj, &ret) == S_OK)
+                {
+                    VARIANT vt;
+                    if (!partBuf[0] &&
+                        SUCCEEDED(pObj->Get(L"PartNumber", 0, &vt, nullptr, nullptr)) &&
+                        vt.vt == VT_BSTR && vt.bstrVal)
+                    {
+                        wcscpy_s(partBuf, vt.bstrVal);
+                        for (int i = (int)wcslen(partBuf) - 1; i >= 0 && partBuf[i] == L' '; --i)
+                            partBuf[i] = L'\0';
+                        VariantClear(&vt);
+                    }
+                    if (!speed &&
+                        SUCCEEDED(pObj->Get(L"ConfiguredClockSpeed", 0, &vt, nullptr, nullptr)) &&
+                        (vt.vt == VT_I4 || vt.vt == VT_UI4))
+                    {
+                        speed = (vt.vt == VT_I4) ? (DWORD)vt.lVal : vt.uintVal;
+                        VariantClear(&vt);
+                    }
+                    if (!speed &&
+                        SUCCEEDED(pObj->Get(L"Speed", 0, &vt, nullptr, nullptr)) &&
+                        (vt.vt == VT_I4 || vt.vt == VT_UI4))
+                    {
+                        speed = (vt.vt == VT_I4) ? (DWORD)vt.lVal : vt.uintVal;
+                        VariantClear(&vt);
+                    }
+                    pObj->Release();
+                }
+                pEnum->Release();
+            }
+            SysFreeString(query);
+            SysFreeString(wql);
+            pSvc->Release();
+        }
+        SysFreeString(bns);
+        pLoc->Release();
+    }
+    if (hrCom == S_OK || hrCom == S_FALSE) CoUninitialize();
+
+    if (partBuf[0])
+    {
+        if (speed)
+            swprintf_s(buf, len, L"%s (%llu GB, %u MHz)", partBuf, gb, speed);
+        else
+            swprintf_s(buf, len, L"%s (%llu GB)", partBuf, gb);
+    }
+    else if (speed)
+        swprintf_s(buf, len, L"RAM %u MHz (%llu GB)", speed, gb);
+    else
+        swprintf_s(buf, len, L"RAM (%llu GB)", gb);
 }
 
 // Query the storage device product name for \\.\\PhysicalDriveN via IOCTL.
@@ -1803,6 +1891,49 @@ static LONG ReadCpuTempHwInfo()
     return result;
 }
 
+// Returns max RAM/DIMM temperature in tenths of °C from HWiNFO shared memory, or 0 if unavailable.
+static LONG ReadRamTempHwInfo()
+{
+    HANDLE hMap = OpenFileMappingA(FILE_MAP_READ, FALSE, HWINFO_SM_NAME);
+    if (!hMap) return 0;
+
+    const void* pView = MapViewOfFile(hMap, FILE_MAP_READ, 0, 0, 0);
+    if (!pView) { CloseHandle(hMap); return 0; }
+
+    LONG result = 0;
+    const auto* hdr = static_cast<const HWiNFO_HEADER*>(pView);
+
+    if (hdr->dwSignature == HWINFO_SM_SIG && hdr->dwNumReadingElements > 0)
+    {
+        const BYTE* base   = static_cast<const BYTE*>(pView);
+        const BYTE* rdBase = base + hdr->dwOffsetOfReadingSection;
+        DWORD       stride = hdr->dwSizeOfReadingElement;
+        DWORD       count  = hdr->dwNumReadingElements;
+
+        double maxTemp = 0.0;
+        for (DWORD i = 0; i < count; ++i)
+        {
+            const auto* r = reinterpret_cast<const HWiNFO_READING*>(rdBase + i * stride);
+            if (r->tReading != 1) continue;
+            if (r->Value <= 0.0 || r->Value > 150.0) continue;
+
+            const char* lbl = r->szLabelOrig[0] ? r->szLabelOrig : r->szLabelUser;
+            if (strstr(lbl, "DIMM")   ||
+                strstr(lbl, "Memory") ||
+                (strstr(lbl, "RAM") && !strstr(lbl, "GPU")))
+            {
+                if (r->Value > maxTemp) maxTemp = r->Value;
+            }
+        }
+        if (maxTemp > 0.0)
+            result = (LONG)(maxTemp * 10.0 + 0.5);
+    }
+
+    UnmapViewOfFile(pView);
+    CloseHandle(hMap);
+    return result;
+}
+
 // -----------------------------------------------------------------------
 // WMI CPU temperature background thread.
 // Priority order each tick:
@@ -2083,6 +2214,10 @@ static void SampleMetrics()
             double totalGB = (double)ms.ullTotalPhys / (1024.0 * 1024.0 * 1024.0);
             swprintf_s(g_charts[2].absStr, L"%.1f / %.0f GB", usedGB, totalGB);
         }
+
+        // RAM temperature via HWiNFO64 shared memory (requires DIMM sensors)
+        LONG ramTempDeciC = ReadRamTempHwInfo();
+        PushTempChart(g_ramTempChart, ramTempDeciC / 10.0, ramTempDeciC > 0);
     }
 
     // Disk – PDH % Disk Time (_Total + per-disk)
@@ -2430,6 +2565,7 @@ static void UpdateLayeredContent(HWND hwnd)
             // Store chart rects for click detection (chart portion only)
             g_cpuChartRect  = { chartLeft, VEDGE,                       chartLeft + colW, VEDGE + rowH };
             g_gpuChartRect  = { chartLeft, VEDGE + (rowH + PAD),        chartLeft + colW, VEDGE + (rowH + PAD) + rowH };
+            g_ramChartRect  = { chartLeft, VEDGE + 2.f * (rowH + PAD),  chartLeft + colW, VEDGE + 2.f * (rowH + PAD) + rowH };
             g_diskChartRect = { chartLeft, VEDGE + 3.f * (rowH + PAD),  chartLeft + colW, VEDGE + 3.f * (rowH + PAD) + rowH };
 
             const float titleH = g_fontSize * 1.4f;
@@ -2460,7 +2596,7 @@ static void UpdateLayeredContent(HWND hwnd)
                         float chartY = y + titleH;
                         int miniSamples = max(2, CHART_SAMPLES / 2);
                         DrawChart(g_pDCRT, g_charts[0],    { x,         chartY, x + halfW, y + rowH }, nullptr, g_pChartFmtR, miniSamples);
-                        DrawChart(g_pDCRT, g_cpuTempChart, { x + halfW, chartY, x + colW,  y + rowH }, nullptr, g_pChartFmtR, miniSamples);
+                        DrawChart(g_pDCRT, g_cpuTempChart, { x + halfW, chartY, x + colW,  y + rowH }, nullptr, g_pChartFmtR, miniSamples, true);
                     }
                     else
                     {
@@ -2505,6 +2641,16 @@ static void UpdateLayeredContent(HWND hwnd)
                         DrawChart(g_pDCRT, g_gpuVramChart, { x + thirdW,      chartY, x + 2.f*thirdW, y + rowH }, nullptr, g_pChartFmtR, miniSamples);
                         DrawChart(g_pDCRT, g_gpuTempChart, { x + 2.f*thirdW,  chartY, x + colW,       y + rowH }, nullptr, g_pChartFmtR, miniSamples, true);
                     }
+                }
+                else if (i == 2 && g_ramMode == 1)
+                {
+                    // Load (left) + Temp (right) side by side
+                    drawChartTitle(g_charts[2].name);
+                    float halfW  = colW / 2.f;
+                    float chartY = y + titleH;
+                    int miniSamples = max(2, CHART_SAMPLES / 2);
+                    DrawChart(g_pDCRT, g_charts[2],    { x,         chartY, x + halfW, y + rowH }, nullptr, g_pChartFmtR, miniSamples);
+                    DrawChart(g_pDCRT, g_ramTempChart, { x + halfW, chartY, x + colW,  y + rowH }, nullptr, g_pChartFmtR, miniSamples, true);
                 }
                 else if (i == 3 && g_diskMode > 0)
                 {
@@ -2648,6 +2794,7 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
         swprintf_s(g_gpuVramChart.name, L"%s VRAM", g_charts[1].name);
         swprintf_s(g_gpuTempChart.name, L"%s Temp", g_charts[1].name);
         swprintf_s(g_cpuTempChart.name, L"%s Temp", g_charts[0].name);
+        swprintf_s(g_ramTempChart.name, L"%s Temp", g_charts[2].name);
 
         DetectCoreTopology();
 
@@ -2911,6 +3058,11 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
             (float)my >= g_gpuChartRect.top  && (float)my <= g_gpuChartRect.bottom)
             return HTCLIENT;
 
+        // RAM chart row
+        if ((float)mx >= g_ramChartRect.left && (float)mx <= g_ramChartRect.right &&
+            (float)my >= g_ramChartRect.top  && (float)my <= g_ramChartRect.bottom)
+            return HTCLIENT;
+
         // Disk chart row
         if ((float)mx >= g_diskChartRect.left && (float)mx <= g_diskChartRect.right &&
             (float)my >= g_diskChartRect.top  && (float)my <= g_diskChartRect.bottom)
@@ -2997,6 +3149,14 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
         {
             // Cycle GPU mode: 0 (core) → 1 (VRAM %) → 2 (temp) → 3 (core+VRAM) → 4 (core+VRAM+temp) → 0
             g_gpuMode = (g_gpuMode + 1) % 5;
+            SaveWindowState(hwnd);
+            UpdateLayeredContent(hwnd);
+        }
+        else if ((float)mx >= g_ramChartRect.left && (float)mx <= g_ramChartRect.right &&
+                 (float)my >= g_ramChartRect.top  && (float)my <= g_ramChartRect.bottom)
+        {
+            // Cycle RAM mode: 0 (load) → 1 (load+temp) → 0
+            g_ramMode = (g_ramMode + 1) % 2;
             SaveWindowState(hwnd);
             UpdateLayeredContent(hwnd);
         }
