@@ -192,11 +192,21 @@ static PFN_nvmlShutdown               g_nvmlShutdown  = NULL;
 // Per-disk state
 // -----------------------------------------------------------------------
 static const int    MAX_DISKS = 16;
-static int          g_diskMode  = 0; // 0=_Total, 1..N = disk index (1-based)
+static int          g_diskMode    = 0; // 0=_Total, 1..N = disk index (1-based)
+static int          g_diskSubMode = 0; // 0=single, 1=read+write, 2=read+write+temp
 static int          g_diskCount = 0;
-static Chart        g_diskCharts[MAX_DISKS]     = {};
-static PDH_HCOUNTER g_pdhDiskCtrs[MAX_DISKS]    = {};
+static Chart        g_diskCharts[MAX_DISKS]      = {};
+static Chart        g_diskReadCharts[MAX_DISKS]  = {};
+static Chart        g_diskWriteCharts[MAX_DISKS] = {};
+static Chart        g_diskTempCharts[MAX_DISKS]  = {};
+static PDH_HCOUNTER g_pdhDiskCtrs[MAX_DISKS]     = {};
 static PDH_HCOUNTER g_pdhDiskByteCtrs[MAX_DISKS] = {};
+static PDH_HCOUNTER g_pdhDiskReadCtrs[MAX_DISKS]  = {};
+static PDH_HCOUNTER g_pdhDiskWriteCtrs[MAX_DISKS] = {};
+static double       g_diskIoPeak[MAX_DISKS]        = {};
+static Chart        g_diskTotalReadChart  = {};
+static Chart        g_diskTotalWriteChart = {};
+static double       g_diskTotalIoPeak    = 0.0;
 static D2D1_RECT_F  g_diskChartRect  = {};
 static D2D1_RECT_F  g_weatherRect    = {};
 
@@ -273,7 +283,15 @@ static void FlushDisplayValues()
     flush(g_gpuTempChart);
     flush(g_cpuTempChart);
     flush(g_ramTempChart);
-    for (int i = 0; i < g_diskCount; ++i)        flush(g_diskCharts[i]);
+    flush(g_diskTotalReadChart);
+    flush(g_diskTotalWriteChart);
+    for (int i = 0; i < g_diskCount; ++i)
+    {
+        flush(g_diskCharts[i]);
+        flush(g_diskReadCharts[i]);
+        flush(g_diskWriteCharts[i]);
+        flush(g_diskTempCharts[i]);
+    }
 
     // Sample and flush process lists at the same rate as chart labels.
     // Skip flushing whichever tile the mouse is currently hovering over (freeze on hover).
@@ -691,6 +709,7 @@ static void SaveWindowState(HWND hwnd)
         "    \"gpu_mode\": %d,\n"
         "    \"ram_mode\": %d,\n"
         "    \"disk_mode\": %d,\n"
+        "    \"disk_sub_mode\": %d,\n"
         "    \"font_scale\": %.2f,\n"
         "    \"autostart\": %s,\n"
         "    \"rss_feed_url\": \"%s\",\n"
@@ -701,7 +720,7 @@ static void SaveWindowState(HWND hwnd)
         "}\n",
         escaped, monL, monT, relX, relY, winW, winH,
         (double)g_dividerX, (double)g_dividerY, (double)g_dividerX2,
-        g_cpuMode, g_gpuMode, g_ramMode, g_diskMode,
+        g_cpuMode, g_gpuMode, g_ramMode, g_diskMode, g_diskSubMode,
         (double)g_fontScale,
         g_autostart ? "true" : "false",
         escapedRss,
@@ -875,6 +894,10 @@ static void LoadConfig()
     int diskMode = 0;
     if (JsonInt(buf, "disk_mode", &diskMode) && diskMode >= 0)
         g_diskMode = diskMode; // validated against g_diskCount after enumeration
+
+    int diskSubMode = 0;
+    if (JsonInt(buf, "disk_sub_mode", &diskSubMode) && diskSubMode >= 0 && diskSubMode <= 2)
+        g_diskSubMode = diskSubMode;
 
     {
         static const char* procAbsKeys[NUM_CHARTS] = {
@@ -1466,10 +1489,12 @@ static ULONGLONG    g_cpuPrevTotal = 0;
 static int          g_labelTick     = 0;
 static PDH_HQUERY   g_pdhQuery      = NULL;
 static PDH_HCOUNTER g_pdhGpuCtr    = NULL;
-static PDH_HCOUNTER g_pdhDiskCtr   = NULL;
-static PDH_HCOUNTER g_pdhCpuFreqCtr  = NULL;
-static PDH_HCOUNTER g_pdhCpuPerfCtr  = NULL;
-static PDH_HCOUNTER g_pdhDiskByteCtr = NULL;
+static PDH_HCOUNTER g_pdhDiskCtr      = NULL;
+static PDH_HCOUNTER g_pdhCpuFreqCtr   = NULL;
+static PDH_HCOUNTER g_pdhCpuPerfCtr   = NULL;
+static PDH_HCOUNTER g_pdhDiskByteCtr  = NULL;
+static PDH_HCOUNTER g_pdhDiskReadCtr  = NULL;
+static PDH_HCOUNTER g_pdhDiskWriteCtr = NULL;
 static PDH_HCOUNTER g_pdhGpuMemCtr   = NULL;
 static ULONGLONG    g_gpuTotalVram   = 0;
 
@@ -1667,6 +1692,15 @@ static void EnumerateDisks()
                 PdhAddEnglishCounterW(g_pdhQuery, ctrPath, 0, &g_pdhDiskCtrs[idx]);
                 swprintf_s(ctrPath, L"\\PhysicalDisk(%s)\\Disk Bytes/sec", p);
                 PdhAddEnglishCounterW(g_pdhQuery, ctrPath, 0, &g_pdhDiskByteCtrs[idx]);
+                swprintf_s(ctrPath, L"\\PhysicalDisk(%s)\\Disk Read Bytes/sec", p);
+                PdhAddEnglishCounterW(g_pdhQuery, ctrPath, 0, &g_pdhDiskReadCtrs[idx]);
+                swprintf_s(ctrPath, L"\\PhysicalDisk(%s)\\Disk Write Bytes/sec", p);
+                PdhAddEnglishCounterW(g_pdhQuery, ctrPath, 0, &g_pdhDiskWriteCtrs[idx]);
+
+                // Set names for read/write/temp charts
+                swprintf_s(g_diskReadCharts[idx].name,  L"%s Read",  g_diskCharts[idx].name);
+                swprintf_s(g_diskWriteCharts[idx].name, L"%s Write", g_diskCharts[idx].name);
+                swprintf_s(g_diskTempCharts[idx].name,  L"%s Temp",  g_diskCharts[idx].name);
 
                 g_diskCount++;
             }
@@ -1927,6 +1961,65 @@ static LONG ReadRamTempHwInfo()
         }
         if (maxTemp > 0.0)
             result = (LONG)(maxTemp * 10.0 + 0.5);
+    }
+
+    UnmapViewOfFile(pView);
+    CloseHandle(hMap);
+    return result;
+}
+
+// Returns temperature of physical disk `diskIdx` (0-based) in tenths of °C from HWiNFO shared
+// memory, grouping readings by sensor. Returns 0 if HWiNFO is not running or no data.
+static LONG ReadDiskTempHwInfo(int diskIdx)
+{
+    HANDLE hMap = OpenFileMappingA(FILE_MAP_READ, FALSE, HWINFO_SM_NAME);
+    if (!hMap) return 0;
+    const void* pView = MapViewOfFile(hMap, FILE_MAP_READ, 0, 0, 0);
+    if (!pView) { CloseHandle(hMap); return 0; }
+
+    LONG result = 0;
+    const auto* hdr = static_cast<const HWiNFO_HEADER*>(pView);
+    if (hdr->dwSignature == HWINFO_SM_SIG && hdr->dwNumReadingElements > 0)
+    {
+        const BYTE* base   = static_cast<const BYTE*>(pView);
+        const BYTE* rdBase = base + hdr->dwOffsetOfReadingSection;
+        DWORD       stride = hdr->dwSizeOfReadingElement;
+        DWORD       count  = hdr->dwNumReadingElements;
+
+        // Collect per-sensor max temperatures for disk sensors.
+        // Sensors are identified by dwSensorIndex and ordered by first appearance.
+        DWORD  seenSensors[MAX_DISKS]   = {};
+        double sensorMaxTemp[MAX_DISKS] = {};
+        int    sensorCount = 0;
+
+        for (DWORD i = 0; i < count; ++i)
+        {
+            const auto* r = reinterpret_cast<const HWiNFO_READING*>(rdBase + i * stride);
+            if (r->tReading != 1) continue;
+            if (r->Value <= 0.0 || r->Value > 150.0) continue;
+
+            const char* lbl = r->szLabelOrig[0] ? r->szLabelOrig : r->szLabelUser;
+            bool isDisk = strstr(lbl, "Drive")  || strstr(lbl, "SSD") ||
+                          strstr(lbl, "HDD")    || strstr(lbl, "NVMe") ||
+                          strstr(lbl, "M.2")    || strstr(lbl, "Temperature");
+            if (!isDisk) continue;
+            if (strstr(lbl, "CPU") || strstr(lbl, "GPU") ||
+                strstr(lbl, "DIMM") || strstr(lbl, "RAM")) continue;
+
+            int sidx = -1;
+            for (int s = 0; s < sensorCount; s++)
+                if (seenSensors[s] == r->dwSensorIndex) { sidx = s; break; }
+            if (sidx < 0 && sensorCount < MAX_DISKS)
+            {
+                sidx = sensorCount;
+                seenSensors[sensorCount++] = r->dwSensorIndex;
+            }
+            if (sidx >= 0 && r->Value > sensorMaxTemp[sidx])
+                sensorMaxTemp[sidx] = r->Value;
+        }
+
+        if (diskIdx < sensorCount && sensorMaxTemp[diskIdx] > 0.0)
+            result = (LONG)(sensorMaxTemp[diskIdx] * 10.0 + 0.5);
     }
 
     UnmapViewOfFile(pView);
@@ -2220,7 +2313,7 @@ static void SampleMetrics()
         PushTempChart(g_ramTempChart, ramTempDeciC / 10.0, ramTempDeciC > 0);
     }
 
-    // Disk – PDH % Disk Time (_Total + per-disk)
+    // Disk – PDH % Disk Time + read/write bytes (_Total + per-disk)
     {
         double v = 0.0;
         if (g_pdhDiskCtr)
@@ -2240,6 +2333,37 @@ static void SampleMetrics()
                     nullptr, &val) == ERROR_SUCCESS &&
                 val.CStatus == PDH_CSTATUS_VALID_DATA)
                 swprintf_s(g_charts[3].absStr, L"%.1f MB/s", val.doubleValue / (1024.0 * 1024.0));
+        }
+
+        // _Total read/write sampling
+        {
+            double readMb = 0.0, writeMb = 0.0;
+            if (g_pdhDiskReadCtr)
+            {
+                PDH_FMT_COUNTERVALUE val;
+                if (PdhGetFormattedCounterValue(g_pdhDiskReadCtr, PDH_FMT_DOUBLE,
+                        nullptr, &val) == ERROR_SUCCESS &&
+                    val.CStatus == PDH_CSTATUS_VALID_DATA)
+                    readMb = val.doubleValue / (1024.0 * 1024.0);
+            }
+            if (g_pdhDiskWriteCtr)
+            {
+                PDH_FMT_COUNTERVALUE val;
+                if (PdhGetFormattedCounterValue(g_pdhDiskWriteCtr, PDH_FMT_DOUBLE,
+                        nullptr, &val) == ERROR_SUCCESS &&
+                    val.CStatus == PDH_CSTATUS_VALID_DATA)
+                    writeMb = val.doubleValue / (1024.0 * 1024.0);
+            }
+            double combined = readMb + writeMb;
+            if (combined > g_diskTotalIoPeak)
+                g_diskTotalIoPeak = combined * 1.1 + 0.1;
+            else if (g_diskTotalIoPeak > 0.1)
+                g_diskTotalIoPeak = max(combined, g_diskTotalIoPeak * 0.9998);
+            double peak = max(g_diskTotalIoPeak, 0.1);
+            PushChartValue(g_diskTotalReadChart,  max(0.0, min(readMb  / peak, 1.0)));
+            PushChartValue(g_diskTotalWriteChart, max(0.0, min(writeMb / peak, 1.0)));
+            swprintf_s(g_diskTotalReadChart.absStr,  L"%.1f MB/s", readMb);
+            swprintf_s(g_diskTotalWriteChart.absStr, L"%.1f MB/s", writeMb);
         }
 
         // Per-disk sampling
@@ -2265,6 +2389,41 @@ static void SampleMetrics()
                     swprintf_s(g_diskCharts[di].absStr, L"%.1f MB/s",
                         val.doubleValue / (1024.0 * 1024.0));
             }
+
+            // Per-disk read/write sampling (auto-scaled, shared peak for comparison)
+            {
+                double readMb = 0.0, writeMb = 0.0;
+                if (g_pdhDiskReadCtrs[di])
+                {
+                    PDH_FMT_COUNTERVALUE val;
+                    if (PdhGetFormattedCounterValue(g_pdhDiskReadCtrs[di], PDH_FMT_DOUBLE,
+                            nullptr, &val) == ERROR_SUCCESS &&
+                        val.CStatus == PDH_CSTATUS_VALID_DATA)
+                        readMb = val.doubleValue / (1024.0 * 1024.0);
+                }
+                if (g_pdhDiskWriteCtrs[di])
+                {
+                    PDH_FMT_COUNTERVALUE val;
+                    if (PdhGetFormattedCounterValue(g_pdhDiskWriteCtrs[di], PDH_FMT_DOUBLE,
+                            nullptr, &val) == ERROR_SUCCESS &&
+                        val.CStatus == PDH_CSTATUS_VALID_DATA)
+                        writeMb = val.doubleValue / (1024.0 * 1024.0);
+                }
+                double combined = readMb + writeMb;
+                if (combined > g_diskIoPeak[di])
+                    g_diskIoPeak[di] = combined * 1.1 + 0.1;
+                else if (g_diskIoPeak[di] > 0.1)
+                    g_diskIoPeak[di] = max(combined, g_diskIoPeak[di] * 0.9998);
+                double peak = max(g_diskIoPeak[di], 0.1);
+                PushChartValue(g_diskReadCharts[di],  max(0.0, min(readMb  / peak, 1.0)));
+                PushChartValue(g_diskWriteCharts[di], max(0.0, min(writeMb / peak, 1.0)));
+                swprintf_s(g_diskReadCharts[di].absStr,  L"%.1f MB/s", readMb);
+                swprintf_s(g_diskWriteCharts[di].absStr, L"%.1f MB/s", writeMb);
+            }
+
+            // Per-disk temperature from HWiNFO
+            LONG tempDeciC = ReadDiskTempHwInfo(di);
+            PushTempChart(g_diskTempCharts[di], tempDeciC / 10.0, tempDeciC > 0);
         }
     }
 
@@ -2652,11 +2811,46 @@ static void UpdateLayeredContent(HWND hwnd)
                     DrawChart(g_pDCRT, g_charts[2],    { x,         chartY, x + halfW, y + rowH }, nullptr, g_pChartFmtR, miniSamples);
                     DrawChart(g_pDCRT, g_ramTempChart, { x + halfW, chartY, x + colW,  y + rowH }, nullptr, g_pChartFmtR, miniSamples, true);
                 }
-                else if (i == 3 && g_diskMode > 0)
+                else if (i == 3 && (g_diskMode > 0 || g_diskSubMode > 0))
                 {
-                    int di = g_diskMode - 1;
-                    const Chart& dc = (di < g_diskCount) ? g_diskCharts[di] : g_charts[3];
-                    DrawChart(g_pDCRT, dc, area, g_pChartFmtL, g_pChartFmtR);
+                    int di = g_diskMode - 1; // -1 for _Total
+                    bool isTotal = (g_diskMode == 0);
+                    bool validDisk = !isTotal && di < g_diskCount;
+
+                    const Chart& baseChart = (validDisk ? g_diskCharts[di] : g_charts[3]);
+                    const Chart& readChart  = (validDisk ? g_diskReadCharts[di]  : g_diskTotalReadChart);
+                    const Chart& writeChart = (validDisk ? g_diskWriteCharts[di] : g_diskTotalWriteChart);
+                    const Chart* tempChart  = (validDisk ? &g_diskTempCharts[di] : nullptr);
+
+                    if (g_diskSubMode == 1)
+                    {
+                        // Read (left) + Write (right) side by side
+                        drawChartTitle(baseChart.name);
+                        float halfW  = colW / 2.f;
+                        float chartY = y + titleH;
+                        int miniSamples = max(2, CHART_SAMPLES / 2);
+                        DrawChart(g_pDCRT, readChart,  { x,         chartY, x + halfW, y + rowH }, nullptr, g_pChartFmtR, miniSamples, true);
+                        DrawChart(g_pDCRT, writeChart, { x + halfW, chartY, x + colW,  y + rowH }, nullptr, g_pChartFmtR, miniSamples, true);
+                    }
+                    else if (g_diskSubMode == 2 && tempChart)
+                    {
+                        // Read + Write + Temp, three panels
+                        drawChartTitle(baseChart.name);
+                        float thirdW = colW / 3.f;
+                        float chartY = y + titleH;
+                        int miniSamples = max(2, CHART_SAMPLES / 3);
+                        DrawChart(g_pDCRT, readChart,   { x,              chartY, x + thirdW,     y + rowH }, nullptr, g_pChartFmtR, miniSamples, true);
+                        DrawChart(g_pDCRT, writeChart,  { x + thirdW,     chartY, x + 2.f*thirdW, y + rowH }, nullptr, g_pChartFmtR, miniSamples, true);
+                        DrawChart(g_pDCRT, *tempChart,  { x + 2.f*thirdW, chartY, x + colW,       y + rowH }, nullptr, g_pChartFmtR, miniSamples, true);
+                    }
+                    else if (g_diskMode > 0)
+                    {
+                        DrawChart(g_pDCRT, baseChart, area, g_pChartFmtL, g_pChartFmtR);
+                    }
+                    else
+                    {
+                        DrawChart(g_pDCRT, g_charts[3], area, g_pChartFmtL, g_pChartFmtR);
+                    }
                 }
                 else
                 {
@@ -2791,10 +2985,12 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
         GetRamName (g_charts[2].name, 256);
         GetDiskName(g_charts[3].name, 256);
 
-        swprintf_s(g_gpuVramChart.name, L"%s VRAM", g_charts[1].name);
-        swprintf_s(g_gpuTempChart.name, L"%s Temp", g_charts[1].name);
-        swprintf_s(g_cpuTempChart.name, L"%s Temp", g_charts[0].name);
-        swprintf_s(g_ramTempChart.name, L"%s Temp", g_charts[2].name);
+        swprintf_s(g_gpuVramChart.name,       L"%s VRAM",  g_charts[1].name);
+        swprintf_s(g_gpuTempChart.name,       L"%s Temp",  g_charts[1].name);
+        swprintf_s(g_cpuTempChart.name,       L"%s Temp",  g_charts[0].name);
+        swprintf_s(g_ramTempChart.name,       L"%s Temp",  g_charts[2].name);
+        swprintf_s(g_diskTotalReadChart.name,  L"%s Read",  g_charts[3].name);
+        swprintf_s(g_diskTotalWriteChart.name, L"%s Write", g_charts[3].name);
 
         DetectCoreTopology();
 
@@ -2815,6 +3011,12 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
             PdhAddEnglishCounterW(g_pdhQuery,
                 L"\\PhysicalDisk(_Total)\\Disk Bytes/sec",
                 0, &g_pdhDiskByteCtr);
+            PdhAddEnglishCounterW(g_pdhQuery,
+                L"\\PhysicalDisk(_Total)\\Disk Read Bytes/sec",
+                0, &g_pdhDiskReadCtr);
+            PdhAddEnglishCounterW(g_pdhQuery,
+                L"\\PhysicalDisk(_Total)\\Disk Write Bytes/sec",
+                0, &g_pdhDiskWriteCtr);
             PdhAddEnglishCounterW(g_pdhQuery,
                 L"\\GPU Adapter Memory(*)\\Dedicated Usage",
                 0, &g_pdhGpuMemCtr);
@@ -3163,13 +3365,17 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
         else if ((float)mx >= g_diskChartRect.left && (float)mx <= g_diskChartRect.right &&
                  (float)my >= g_diskChartRect.top  && (float)my <= g_diskChartRect.bottom)
         {
-            if (g_diskCount > 0)
+            // Cycle sub-mode first (single → read+write → read+write+temp),
+            // then advance to next disk when sub-mode wraps.
+            g_diskSubMode++;
+            if (g_diskSubMode >= 3)
             {
-                // Cycle: 0 (_Total) → 1 (disk 0) → 2 (disk 1) → … → 0
-                g_diskMode = (g_diskMode + 1) % (g_diskCount + 1);
-                SaveWindowState(hwnd);
-                UpdateLayeredContent(hwnd);
+                g_diskSubMode = 0;
+                if (g_diskCount > 0)
+                    g_diskMode = (g_diskMode + 1) % (g_diskCount + 1);
             }
+            SaveWindowState(hwnd);
+            UpdateLayeredContent(hwnd);
         }
         else if ((float)mx >= g_weatherRect.left && (float)mx <= g_weatherRect.right &&
                  (float)my >= g_weatherRect.top  && (float)my <= g_weatherRect.bottom)
