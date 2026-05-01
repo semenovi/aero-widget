@@ -255,32 +255,17 @@ static void SampleProcesses(); // forward declaration
 
 static void FlushDisplayValues()
 {
-    for (int i = 0; i < NUM_CHARTS; ++i)
-    {
-        g_charts[i].displayCurrent = g_charts[i].current;
-        wcscpy_s(g_charts[i].displayAbsStr, g_charts[i].absStr);
-    }
-    for (int i = 0; i < g_logicalCoreCount; ++i)
-    {
-        g_logicalCharts[i].displayCurrent = g_logicalCharts[i].current;
-        wcscpy_s(g_logicalCharts[i].displayAbsStr, g_logicalCharts[i].absStr);
-    }
-    for (int i = 0; i < g_physicalCoreCount; ++i)
-    {
-        g_physicalCharts[i].displayCurrent = g_physicalCharts[i].current;
-        wcscpy_s(g_physicalCharts[i].displayAbsStr, g_physicalCharts[i].absStr);
-    }
-    g_gpuVramChart.displayCurrent = g_gpuVramChart.current;
-    wcscpy_s(g_gpuVramChart.displayAbsStr, g_gpuVramChart.absStr);
-    g_gpuTempChart.displayCurrent = g_gpuTempChart.current;
-    wcscpy_s(g_gpuTempChart.displayAbsStr, g_gpuTempChart.absStr);
-    g_cpuTempChart.displayCurrent = g_cpuTempChart.current;
-    wcscpy_s(g_cpuTempChart.displayAbsStr, g_cpuTempChart.absStr);
-    for (int i = 0; i < g_diskCount; ++i)
-    {
-        g_diskCharts[i].displayCurrent = g_diskCharts[i].current;
-        wcscpy_s(g_diskCharts[i].displayAbsStr, g_diskCharts[i].absStr);
-    }
+    auto flush = [](Chart& c) {
+        c.displayCurrent = c.current;
+        wcscpy_s(c.displayAbsStr, c.absStr);
+    };
+    for (int i = 0; i < NUM_CHARTS; ++i)        flush(g_charts[i]);
+    for (int i = 0; i < g_logicalCoreCount; ++i) flush(g_logicalCharts[i]);
+    for (int i = 0; i < g_physicalCoreCount; ++i) flush(g_physicalCharts[i]);
+    flush(g_gpuVramChart);
+    flush(g_gpuTempChart);
+    flush(g_cpuTempChart);
+    for (int i = 0; i < g_diskCount; ++i)        flush(g_diskCharts[i]);
 
     // Sample and flush process lists at the same rate as chart labels.
     // Skip flushing whichever tile the mouse is currently hovering over (freeze on hover).
@@ -647,6 +632,14 @@ static BOOL CALLBACK FindMonitorProc(HMONITOR hMon, HDC, LPRECT, LPARAM lp)
     return TRUE;
 }
 
+static void JsonEscapeStr(const char* src, char* dst, int dstLen)
+{
+    for (int i = 0, j = 0; src[i] && j < dstLen - 3; i++) {
+        if (src[i] == '"' || src[i] == '\\') dst[j++] = '\\';
+        dst[j++] = src[i];
+    }
+}
+
 // Save current window position, size, monitor and divider to config.json
 static void SaveWindowState(HWND hwnd)
 {
@@ -664,22 +657,10 @@ static void SaveWindowState(HWND hwnd)
     int winW = rcWin.right  - rcWin.left;
     int winH = rcWin.bottom - rcWin.top;
 
-    // Escape location string for JSON (handle '"' and '\')
     char escaped[512] = {};
-    for (int i = 0, j = 0; g_location[i] && j < (int)sizeof(escaped) - 3; i++)
-    {
-        if (g_location[i] == '"' || g_location[i] == '\\')
-            escaped[j++] = '\\';
-        escaped[j++] = g_location[i];
-    }
-
+    JsonEscapeStr(g_location, escaped, sizeof(escaped));
     char escapedRss[1024] = {};
-    for (int i = 0, j = 0; g_rssFeedUrl[i] && j < (int)sizeof(escapedRss) - 3; i++)
-    {
-        if (g_rssFeedUrl[i] == '"' || g_rssFeedUrl[i] == '\\')
-            escapedRss[j++] = '\\';
-        escapedRss[j++] = g_rssFeedUrl[i];
-    }
+    JsonEscapeStr(g_rssFeedUrl, escapedRss, sizeof(escapedRss));
 
     wchar_t path[MAX_PATH];
     GetConfigPath(path, MAX_PATH);
@@ -1181,7 +1162,7 @@ static void DrawHabrPanel(ID2D1RenderTarget* rt, D2D1_RECT_F area, int hoverIdx)
 {
     if (!g_pChartFmtL || !g_pDWFactory) return;
 
-    HabrArticle* articles = new HabrArticle[MAX_HABR];
+    static HabrArticle articles[MAX_HABR];
     int count = 0;
     EnterCriticalSection(&g_habrCS);
     memcpy(articles, g_habr, sizeof(HabrArticle) * g_habrCount);
@@ -1192,10 +1173,7 @@ static void DrawHabrPanel(ID2D1RenderTarget* rt, D2D1_RECT_F area, int hoverIdx)
 
     ID2D1SolidColorBrush* pBrush = nullptr;
     if (FAILED(rt->CreateSolidColorBrush(D2D1::ColorF(0.f, 0.f, 0.f, 1.f), &pBrush)))
-    {
-        delete[] articles;
         return;
-    }
 
     if (count == 0)
     {
@@ -1207,7 +1185,6 @@ static void DrawHabrPanel(ID2D1RenderTarget* rt, D2D1_RECT_F area, int hoverIdx)
             pDim->Release();
         }
         pBrush->Release();
-        delete[] articles;
         return;
     }
 
@@ -1247,7 +1224,6 @@ static void DrawHabrPanel(ID2D1RenderTarget* rt, D2D1_RECT_F area, int hoverIdx)
     }
 
     pBrush->Release();
-    delete[] articles;
 }
 
 static DWORD WINAPI WeatherThreadProc(LPVOID)
@@ -1428,8 +1404,7 @@ static void DrawWeather(ID2D1RenderTarget* rt, const WeatherData& wd, D2D1_RECT_
     ID2D1SolidColorBrush* pBrush = nullptr;
     if (FAILED(rt->CreateSolidColorBrush(D2D1::ColorF(0.f, 0.f, 0.f, 1.f), &pBrush))) return;
 
-    const float lh     = g_fontSize * 1.4f;
-    const float lhMono = g_fontSize * 1.4f;   // same line height as main text
+    const float lh = g_fontSize * 1.4f;
     float y = area.top;
 
     // ASCII art icon (monospace, compact)
@@ -1437,18 +1412,18 @@ static void DrawWeather(ID2D1RenderTarget* rt, const WeatherData& wd, D2D1_RECT_
     {
         for (int j = 0; j < 5; j++)
         {
-            if (!wd.ascii[j][0]) { y += lhMono; continue; }
-            if (y + lhMono > area.bottom) break;
-            D2D1_RECT_F r = { area.left, y, area.right, y + lhMono };
+            if (!wd.ascii[j][0]) { y += lh; continue; }
+            if (y + lh > area.bottom) break;
+            D2D1_RECT_F r = { area.left, y, area.right, y + lh };
             DrawTextEllipsis(rt, wd.ascii[j], (UINT32)wcslen(wd.ascii[j]),
                              g_pMonoFmt, r, pBrush);
-            y += lhMono;
+            y += lh;
         }
         y += lh * 0.3f;
     }
     else
     {
-        y += lhMono * 5 + lh * 0.3f;
+        y += lh * 5 + lh * 0.3f;
     }
 
     auto drawLine = [&](const wchar_t* text)
@@ -1532,32 +1507,34 @@ static void GetRamName(wchar_t* buf, int len)
     swprintf_s(buf, len, L"RAM (%llu GB)", gb);
 }
 
+// Query the storage device product name for \\.\\PhysicalDriveN via IOCTL.
+// Writes trimmed wide string to buf on success; leaves buf unchanged on failure.
+static void GetDiskProductName(int diskNum, wchar_t* buf, int len)
+{
+    wchar_t path[64];
+    swprintf_s(path, L"\\\\.\\PhysicalDrive%d", diskNum);
+    HANDLE h = CreateFileW(path, 0, FILE_SHARE_READ | FILE_SHARE_WRITE,
+                           nullptr, OPEN_EXISTING, 0, nullptr);
+    if (h == INVALID_HANDLE_VALUE) return;
+    char raw[512] = {};
+    STORAGE_PROPERTY_QUERY q = { StorageDeviceProperty, PropertyStandardQuery };
+    DWORD ret = 0;
+    if (DeviceIoControl(h, IOCTL_STORAGE_QUERY_PROPERTY, &q, sizeof(q), raw, sizeof(raw), &ret, nullptr))
+    {
+        auto* d = (STORAGE_DEVICE_DESCRIPTOR*)raw;
+        if (d->ProductIdOffset && d->ProductIdOffset < (DWORD)sizeof(raw))
+        {
+            int n = MultiByteToWideChar(CP_ACP, 0, raw + d->ProductIdOffset, -1, buf, len);
+            for (int i = n - 2; i >= 0 && buf[i] == L' '; --i) buf[i] = L'\0';
+        }
+    }
+    CloseHandle(h);
+}
+
 static void GetDiskName(wchar_t* buf, int len)
 {
     wcscpy_s(buf, len, L"Disk");
-    HANDLE h = CreateFileW(L"\\\\.\\PhysicalDrive0",
-        0, FILE_SHARE_READ | FILE_SHARE_WRITE,
-        nullptr, OPEN_EXISTING, 0, nullptr);
-    if (h != INVALID_HANDLE_VALUE)
-    {
-        char raw[512] = {};
-        STORAGE_PROPERTY_QUERY q = { StorageDeviceProperty, PropertyStandardQuery };
-        DWORD ret = 0;
-        if (DeviceIoControl(h, IOCTL_STORAGE_QUERY_PROPERTY,
-                &q, sizeof(q), raw, sizeof(raw), &ret, nullptr))
-        {
-            auto* d = (STORAGE_DEVICE_DESCRIPTOR*)raw;
-            if (d->ProductIdOffset && d->ProductIdOffset < (DWORD)sizeof(raw))
-            {
-                const char* prod = raw + d->ProductIdOffset;
-                int n = MultiByteToWideChar(CP_ACP, 0, prod, -1, buf, len);
-                if (n > 1)
-                    for (int i = n - 2; i >= 0 && buf[i] == L' '; --i)
-                        buf[i] = L'\0';
-            }
-        }
-        CloseHandle(h);
-    }
+    GetDiskProductName(0, buf, len);
 }
 
 // Enumerate physical disk PDH instances, set up per-disk counters and chart names.
@@ -1594,37 +1571,7 @@ static void EnumerateDisks()
                 swprintf_s(g_diskCharts[idx].name, L"Disk %d", idx);
 
                 // Try to get a pretty name from the storage device
-                int diskNum = _wtoi(p);
-                wchar_t drivePath[64];
-                swprintf_s(drivePath, L"\\\\.\\PhysicalDrive%d", diskNum);
-                HANDLE h = CreateFileW(drivePath, 0,
-                    FILE_SHARE_READ | FILE_SHARE_WRITE,
-                    nullptr, OPEN_EXISTING, 0, nullptr);
-                if (h != INVALID_HANDLE_VALUE)
-                {
-                    char raw[512] = {};
-                    STORAGE_PROPERTY_QUERY q = { StorageDeviceProperty, PropertyStandardQuery };
-                    DWORD ret = 0;
-                    if (DeviceIoControl(h, IOCTL_STORAGE_QUERY_PROPERTY,
-                            &q, sizeof(q), raw, sizeof(raw), &ret, nullptr))
-                    {
-                        auto* d = (STORAGE_DEVICE_DESCRIPTOR*)raw;
-                        if (d->ProductIdOffset && d->ProductIdOffset < (DWORD)sizeof(raw))
-                        {
-                            const char* prod = raw + d->ProductIdOffset;
-                            wchar_t prodW[256] = {};
-                            int n = MultiByteToWideChar(CP_ACP, 0, prod, -1, prodW, 256);
-                            if (n > 1)
-                            {
-                                for (int i = n - 2; i >= 0 && prodW[i] == L' '; --i)
-                                    prodW[i] = L'\0';
-                                if (prodW[0])
-                                    wcscpy_s(g_diskCharts[idx].name, prodW);
-                            }
-                        }
-                    }
-                    CloseHandle(h);
-                }
+                GetDiskProductName(_wtoi(p), g_diskCharts[idx].name, 256);
 
                 // Add PDH counters for this disk instance
                 wchar_t ctrPath[256];
@@ -1696,49 +1643,60 @@ static void DetectCoreTopology()
         swprintf_s(g_physicalCharts[i].name, L"P%d", i);
 }
 
+// Allocates the PDH counter array, calls cb(items, count), then frees.
+// Returns false if the counter is null, buffer allocation fails, or PDH fails.
+template<typename Fn>
+static bool PdhEachArray(PDH_HCOUNTER ctr, DWORD fmt, Fn cb)
+{
+    if (!ctr) return false;
+    DWORD sz = 0, cnt = 0;
+    PdhGetFormattedCounterArrayW(ctr, fmt, &sz, &cnt, nullptr);
+    if (!sz) return false;
+    auto* it = (PDH_FMT_COUNTERVALUE_ITEM_W*)malloc(sz);
+    if (!it) return false;
+    bool ok = (PdhGetFormattedCounterArrayW(ctr, fmt, &sz, &cnt, it) == ERROR_SUCCESS);
+    if (ok) cb(it, cnt);
+    free(it);
+    return ok;
+}
+
+// Push a temperature reading (°C) into a chart; writes absStr.
+static void PushTempChart(Chart& c, double tempC, bool gotTemp)
+{
+    if (gotTemp && tempC > 0.0) {
+        PushChartValue(c, max(0.0, min(tempC / 100.0, 1.0)));
+        swprintf_s(c.absStr, L"%.0f°C", tempC);
+    } else {
+        PushChartValue(c, 0.0);
+        wcscpy_s(c.absStr, L"N/A");
+    }
+}
+
 // Sample per-core CPU usage via PDH wildcard counter
 static void SampleCores()
 {
     if (!g_pdhCoreCtr || g_logicalCoreCount == 0) return;
 
-    DWORD sz = 0, cnt = 0;
-    PdhGetFormattedCounterArrayW(g_pdhCoreCtr, PDH_FMT_DOUBLE, &sz, &cnt, nullptr);
-    if (sz == 0) return;
-
-    auto* items = (PDH_FMT_COUNTERVALUE_ITEM_W*)malloc(sz);
-    if (!items) return;
-
     double logVals[MAX_CORES] = {};
-
-    if (PdhGetFormattedCounterArrayW(g_pdhCoreCtr, PDH_FMT_DOUBLE, &sz, &cnt, items) == ERROR_SUCCESS)
-    {
-        for (DWORD j = 0; j < cnt; j++)
-        {
-            if (items[j].FmtValue.CStatus != PDH_CSTATUS_VALID_DATA) continue;
-            const wchar_t* nm = items[j].szName;
+    if (!PdhEachArray(g_pdhCoreCtr, PDH_FMT_DOUBLE, [&](auto* it, DWORD cnt) {
+        for (DWORD j = 0; j < cnt; j++) {
+            if (it[j].FmtValue.CStatus != PDH_CSTATUS_VALID_DATA) continue;
+            const wchar_t* nm = it[j].szName;
             if (wcscmp(nm, L"_Total") == 0) continue;
             // Instance may be "N" or "G,N" (processor group format)
-            int coreIdx = -1;
             const wchar_t* comma = wcschr(nm, L',');
-            if (comma)
-                coreIdx = _wtoi(nm) * 64 + _wtoi(comma + 1);
-            else
-                coreIdx = _wtoi(nm);
+            int coreIdx = comma ? _wtoi(nm) * 64 + _wtoi(comma + 1) : _wtoi(nm);
             if (coreIdx >= 0 && coreIdx < g_logicalCoreCount)
-                logVals[coreIdx] = items[j].FmtValue.doubleValue / 100.0;
+                logVals[coreIdx] = it[j].FmtValue.doubleValue / 100.0;
         }
-    }
-    free(items);
+    })) return;
 
-    // Push logical core values
     for (int i = 0; i < g_logicalCoreCount; i++)
         PushChartValue(g_logicalCharts[i], max(0.0, min(logVals[i], 1.0)));
 
-    // Aggregate logical → physical cores
     double physSum[MAX_CORES] = {};
     int    physCnt[MAX_CORES] = {};
-    for (int i = 0; i < g_logicalCoreCount; i++)
-    {
+    for (int i = 0; i < g_logicalCoreCount; i++) {
         int p = g_logicalToPhysical[i];
         if (p >= 0 && p < MAX_CORES) { physSum[p] += logVals[i]; physCnt[p]++; }
     }
@@ -2040,102 +1998,46 @@ static void SampleMetrics()
         }
 
         // Fallback: PDH Thermal Zone counter (works on some Intel platforms)
-        if (!gotTemp && g_pdhCpuTempCtr)
-        {
-            DWORD sz = 0, cnt = 0;
-            PdhGetFormattedCounterArrayW(g_pdhCpuTempCtr, PDH_FMT_DOUBLE,
-                                         &sz, &cnt, nullptr);
-            if (sz > 0)
-            {
-                auto* items = (PDH_FMT_COUNTERVALUE_ITEM_W*)malloc(sz);
-                if (items)
-                {
-                    if (PdhGetFormattedCounterArrayW(g_pdhCpuTempCtr, PDH_FMT_DOUBLE,
-                            &sz, &cnt, items) == ERROR_SUCCESS)
-                    {
-                        double maxT = 0.0;
-                        for (DWORD i = 0; i < cnt; ++i)
-                            if (items[i].FmtValue.CStatus == PDH_CSTATUS_VALID_DATA)
-                            {
-                                double t = items[i].FmtValue.doubleValue / 10.0 - 273.15;
-                                if (t > maxT) { maxT = t; gotTemp = true; }
-                            }
-                        tempC = maxT;
+        if (!gotTemp)
+            PdhEachArray(g_pdhCpuTempCtr, PDH_FMT_DOUBLE, [&](auto* it, DWORD cnt) {
+                double maxT = 0.0;
+                for (DWORD i = 0; i < cnt; ++i)
+                    if (it[i].FmtValue.CStatus == PDH_CSTATUS_VALID_DATA) {
+                        double t = it[i].FmtValue.doubleValue / 10.0 - 273.15;
+                        if (t > maxT) { maxT = t; gotTemp = true; }
                     }
-                    free(items);
-                }
-            }
-        }
+                tempC = maxT;
+            });
 
-        if (gotTemp && tempC > 0.0)
-        {
-            PushChartValue(g_cpuTempChart, max(0.0, min(tempC / 100.0, 1.0)));
-            swprintf_s(g_cpuTempChart.absStr, L"%.0f\u00B0C", tempC);
-        }
-        else
-        {
-            PushChartValue(g_cpuTempChart, 0.0);
-            wcscpy_s(g_cpuTempChart.absStr, L"N/A");
-        }
+        PushTempChart(g_cpuTempChart, tempC, gotTemp);
     }
 
     // GPU – PDH wildcard over all 3D engine instances
     {
         // Core utilization
         double v = 0.0;
-        if (g_pdhGpuCtr)
-        {
-            DWORD sz = 0, cnt = 0;
-            PdhGetFormattedCounterArrayW(g_pdhGpuCtr, PDH_FMT_DOUBLE,
-                                         &sz, &cnt, nullptr);
-            if (sz > 0)
-            {
-                auto* items = (PDH_FMT_COUNTERVALUE_ITEM_W*)malloc(sz);
-                if (items)
-                {
-                    if (PdhGetFormattedCounterArrayW(g_pdhGpuCtr, PDH_FMT_DOUBLE,
-                            &sz, &cnt, items) == ERROR_SUCCESS)
-                    {
-                        for (DWORD i = 0; i < cnt; ++i)
-                            if (items[i].FmtValue.CStatus == PDH_CSTATUS_VALID_DATA)
-                                v += items[i].FmtValue.doubleValue;
-                    }
-                    free(items);
-                }
-            }
-        }
+        PdhEachArray(g_pdhGpuCtr, PDH_FMT_DOUBLE, [&](auto* it, DWORD cnt) {
+            for (DWORD i = 0; i < cnt; ++i)
+                if (it[i].FmtValue.CStatus == PDH_CSTATUS_VALID_DATA)
+                    v += it[i].FmtValue.doubleValue;
+        });
         PushChartValue(g_charts[1], min(v / 100.0, 1.0));
 
         // VRAM usage
         if (g_pdhGpuMemCtr && g_gpuTotalVram > 0)
         {
-            DWORD sz2 = 0, cnt2 = 0;
-            PdhGetFormattedCounterArrayW(g_pdhGpuMemCtr, PDH_FMT_LARGE,
-                                         &sz2, &cnt2, nullptr);
-            if (sz2 > 0)
-            {
-                auto* items2 = (PDH_FMT_COUNTERVALUE_ITEM_W*)malloc(sz2);
-                if (items2)
-                {
-                    ULONGLONG totalUsed = 0;
-                    if (PdhGetFormattedCounterArrayW(g_pdhGpuMemCtr, PDH_FMT_LARGE,
-                            &sz2, &cnt2, items2) == ERROR_SUCCESS)
-                    {
-                        for (DWORD i = 0; i < cnt2; ++i)
-                            if (items2[i].FmtValue.CStatus == PDH_CSTATUS_VALID_DATA)
-                                totalUsed += (ULONGLONG)items2[i].FmtValue.largeValue;
-                    }
-                    free(items2);
-                    double usedGB  = (double)totalUsed      / (1024.0 * 1024.0 * 1024.0);
-                    double totalGB = (double)g_gpuTotalVram / (1024.0 * 1024.0 * 1024.0);
-                    swprintf_s(g_charts[1].absStr, L"%.1f / %.0f GB", usedGB, totalGB);
-
-                    // VRAM % chart
-                    double vramPct = min((double)totalUsed / (double)g_gpuTotalVram, 1.0);
-                    PushChartValue(g_gpuVramChart, max(0.0, vramPct));
-                    swprintf_s(g_gpuVramChart.absStr, L"%.1f / %.0f GB", usedGB, totalGB);
-                }
-            }
+            ULONGLONG totalUsed = 0;
+            PdhEachArray(g_pdhGpuMemCtr, PDH_FMT_LARGE, [&](auto* it, DWORD cnt) {
+                for (DWORD i = 0; i < cnt; ++i)
+                    if (it[i].FmtValue.CStatus == PDH_CSTATUS_VALID_DATA)
+                        totalUsed += (ULONGLONG)it[i].FmtValue.largeValue;
+            });
+            const double gb = 1.0 / (1024.0 * 1024.0 * 1024.0);
+            double usedGB  = (double)totalUsed      * gb;
+            double totalGB = (double)g_gpuTotalVram * gb;
+            swprintf_s(g_charts[1].absStr,    L"%.1f / %.0f GB", usedGB, totalGB);
+            PushChartValue(g_gpuVramChart, max(0.0, min((double)totalUsed / (double)g_gpuTotalVram, 1.0)));
+            swprintf_s(g_gpuVramChart.absStr, L"%.1f / %.0f GB", usedGB, totalGB);
         }
         else
         {
@@ -2160,38 +2062,13 @@ static void SampleMetrics()
             }
 
             // --- PDH fallback (AMD / Intel / older NVIDIA drivers) ---
-            if (!gotTemp && g_pdhGpuTempCtr)
-            {
-                DWORD sz3 = 0, cnt3 = 0;
-                PdhGetFormattedCounterArrayW(g_pdhGpuTempCtr, PDH_FMT_DOUBLE,
-                                             &sz3, &cnt3, nullptr);
-                if (sz3 > 0)
-                {
-                    auto* items3 = (PDH_FMT_COUNTERVALUE_ITEM_W*)malloc(sz3);
-                    if (items3)
-                    {
-                        if (PdhGetFormattedCounterArrayW(g_pdhGpuTempCtr, PDH_FMT_DOUBLE,
-                                &sz3, &cnt3, items3) == ERROR_SUCCESS)
-                        {
-                            for (DWORD i = 0; i < cnt3; ++i)
-                                if (items3[i].FmtValue.CStatus == PDH_CSTATUS_VALID_DATA)
-                                { tempC = items3[i].FmtValue.doubleValue; gotTemp = true; break; }
-                        }
-                        free(items3);
-                    }
-                }
-            }
-            if (gotTemp)
-            {
-                // Normalize: treat 100°C as 100%
-                PushChartValue(g_gpuTempChart, max(0.0, min(tempC / 100.0, 1.0)));
-                swprintf_s(g_gpuTempChart.absStr, L"%.0f\u00B0C", tempC);
-            }
-            else
-            {
-                PushChartValue(g_gpuTempChart, 0.0);
-                wcscpy_s(g_gpuTempChart.absStr, L"N/A");
-            }
+            if (!gotTemp)
+                PdhEachArray(g_pdhGpuTempCtr, PDH_FMT_DOUBLE, [&](auto* it, DWORD cnt) {
+                    for (DWORD i = 0; i < cnt; ++i)
+                        if (it[i].FmtValue.CStatus == PDH_CSTATUS_VALID_DATA)
+                            { tempC = it[i].FmtValue.doubleValue; gotTemp = true; break; }
+                });
+            PushTempChart(g_gpuTempChart, tempC, gotTemp);
         }
     }
 
@@ -2263,6 +2140,12 @@ static void SampleMetrics()
 // Per-process sampling helpers
 // -----------------------------------------------------------------------
 
+static void StripExeSuffix(wchar_t* s)
+{
+    int n = (int)wcslen(s);
+    if (n >= 4 && _wcsicmp(s + n - 4, L".exe") == 0) s[n - 4] = L'\0';
+}
+
 // Strip "#N" PDH instance suffix and ".exe" extension for clean display name.
 static void NormalizeProcessName(const wchar_t* src, wchar_t* dst, int dstLen)
 {
@@ -2275,9 +2158,7 @@ static void NormalizeProcessName(const wchar_t* src, wchar_t* dst, int dstLen)
             if (!iswdigit(*p)) { allDigits = false; break; }
         if (allDigits) *hash = L'\0';
     }
-    int n = (int)wcslen(dst);
-    if (n >= 4 && _wcsicmp(dst + n - 4, L".exe") == 0)
-        dst[n - 4] = L'\0';
+    StripExeSuffix(dst);
 }
 
 // Get process exe name (without extension) from PID via kernel query.
@@ -2291,11 +2172,8 @@ static void PidToName(DWORD pid, wchar_t* dst, int dstLen)
     if (QueryFullProcessImageNameW(h, 0, buf, &sz) && sz > 0)
     {
         wchar_t* last = wcsrchr(buf, L'\\');
-        const wchar_t* nm = last ? last + 1 : buf;
-        wcsncpy_s(dst, dstLen, nm, _TRUNCATE);
-        int n = (int)wcslen(dst);
-        if (n >= 4 && _wcsicmp(dst + n - 4, L".exe") == 0)
-            dst[n - 4] = L'\0';
+        wcsncpy_s(dst, dstLen, last ? last + 1 : buf, _TRUNCATE);
+        StripExeSuffix(dst);
     }
     CloseHandle(h);
 }
@@ -2330,221 +2208,124 @@ static void SampleProcesses()
     static TempProc temps[1024];
 
     // ---- CPU processes (\\Process(*)\\% Processor Time) ----
-    if (g_pdhProcCpuCtr)
     {
-        DWORD sz = 0, cnt = 0;
-        PdhGetFormattedCounterArrayW(g_pdhProcCpuCtr, PDH_FMT_DOUBLE, &sz, &cnt, nullptr);
-        if (sz > 0)
-        {
-            auto* items = (PDH_FMT_COUNTERVALUE_ITEM_W*)malloc(sz);
-            if (items)
-            {
-                int nT = 0;
-                if (PdhGetFormattedCounterArrayW(g_pdhProcCpuCtr, PDH_FMT_DOUBLE,
-                        &sz, &cnt, items) == ERROR_SUCCESS)
-                {
-                    for (DWORD i = 0; i < cnt; ++i)
-                    {
-                        if (items[i].FmtValue.CStatus != PDH_CSTATUS_VALID_DATA) continue;
-                        double v = items[i].FmtValue.doubleValue;
-                        if (v <= 0.0) continue;
-                        const wchar_t* nm = items[i].szName;
-                        if (wcscmp(nm, L"_Total") == 0 || wcscmp(nm, L"Idle") == 0) continue;
-                        wchar_t clean[64];
-                        NormalizeProcessName(nm, clean, 64);
-                        int idx = TempFindOrAdd(temps, nT, 1024, clean);
-                        if (idx >= 0) { temps[idx].pct += v; temps[idx].absVal += v; }
-                    }
-                }
-                free(items);
-
-                double norm = (g_logicalCoreCount > 0) ? (double)g_logicalCoreCount : 1.0;
-                for (int j = 0; j < nT; ++j) { temps[j].pct /= norm; temps[j].absVal /= norm; }
-                qsort(temps, nT, sizeof(TempProc), CompareTempProcDesc);
-
-                int n = min(nT, MAX_PROC_SHOW);
-                g_procCpuCount = n;
-                for (int j = 0; j < n; ++j)
-                {
-                    wcscpy_s(g_procCpu[j].name, temps[j].name);
-                    g_procCpu[j].pct = (float)min(temps[j].pct, 100.0 * norm);
-                    int ms = (int)(temps[j].pct / 100.0 * 1000.0 + 0.5);
-                    swprintf_s(g_procCpu[j].absStr, L"%d ms/s", ms);
-                }
+        int nT = 0;
+        PdhEachArray(g_pdhProcCpuCtr, PDH_FMT_DOUBLE, [&](auto* it, DWORD cnt) {
+            for (DWORD i = 0; i < cnt; ++i) {
+                if (it[i].FmtValue.CStatus != PDH_CSTATUS_VALID_DATA) continue;
+                double v = it[i].FmtValue.doubleValue;
+                if (v <= 0.0) continue;
+                const wchar_t* nm = it[i].szName;
+                if (wcscmp(nm, L"_Total") == 0 || wcscmp(nm, L"Idle") == 0) continue;
+                wchar_t clean[64];
+                NormalizeProcessName(nm, clean, 64);
+                int idx = TempFindOrAdd(temps, nT, 1024, clean);
+                if (idx >= 0) { temps[idx].pct += v; temps[idx].absVal += v; }
             }
+        });
+        double norm = (g_logicalCoreCount > 0) ? (double)g_logicalCoreCount : 1.0;
+        for (int j = 0; j < nT; ++j) { temps[j].pct /= norm; temps[j].absVal /= norm; }
+        qsort(temps, nT, sizeof(TempProc), CompareTempProcDesc);
+        g_procCpuCount = min(nT, MAX_PROC_SHOW);
+        for (int j = 0; j < g_procCpuCount; ++j) {
+            wcscpy_s(g_procCpu[j].name, temps[j].name);
+            g_procCpu[j].pct = (float)min(temps[j].pct, 100.0 * norm);
+            swprintf_s(g_procCpu[j].absStr, L"%d ms/s", (int)(temps[j].pct / 100.0 * 1000.0 + 0.5));
         }
     }
 
     // ---- GPU processes (parse PIDs from GPU engine instance names) ----
-    if (g_pdhGpuCtr)
     {
-        DWORD sz = 0, cnt = 0;
-        PdhGetFormattedCounterArrayW(g_pdhGpuCtr, PDH_FMT_DOUBLE, &sz, &cnt, nullptr);
-        if (sz > 0)
-        {
-            auto* items = (PDH_FMT_COUNTERVALUE_ITEM_W*)malloc(sz);
-            if (items)
-            {
-                int nT = 0;
-                if (PdhGetFormattedCounterArrayW(g_pdhGpuCtr, PDH_FMT_DOUBLE,
-                        &sz, &cnt, items) == ERROR_SUCCESS)
-                {
-                    for (DWORD i = 0; i < cnt; ++i)
-                    {
-                        if (items[i].FmtValue.CStatus != PDH_CSTATUS_VALID_DATA) continue;
-                        double v = items[i].FmtValue.doubleValue;
-                        if (v <= 0.0) continue;
-                        const wchar_t* nm = items[i].szName;
-                        // Instance format: "pid_NNNN_luid_..."
-                        DWORD pid = 0;
-                        if (wcsncmp(nm, L"pid_", 4) == 0) pid = (DWORD)_wtoi(nm + 4);
-                        if (pid == 0) continue;
-                        wchar_t procName[64] = {};
-                        PidToName(pid, procName, 64);
-                        if (!procName[0]) swprintf_s(procName, L"PID %u", pid);
-                        int idx = TempFindOrAdd(temps, nT, 1024, procName);
-                        if (idx >= 0) temps[idx].pct += v;
-                    }
-                }
-                free(items);
-
-                qsort(temps, nT, sizeof(TempProc), CompareTempProcDesc);
-                int n = min(nT, MAX_PROC_SHOW);
-                g_procGpuCount = n;
-                for (int j = 0; j < n; ++j)
-                {
-                    wcscpy_s(g_procGpu[j].name, temps[j].name);
-                    double pct = min(temps[j].pct, 100.0);
-                    g_procGpu[j].pct = (float)pct;
-                    swprintf_s(g_procGpu[j].absStr, L"%.1f%%", pct);
-                }
+        int nT = 0;
+        PdhEachArray(g_pdhGpuCtr, PDH_FMT_DOUBLE, [&](auto* it, DWORD cnt) {
+            for (DWORD i = 0; i < cnt; ++i) {
+                if (it[i].FmtValue.CStatus != PDH_CSTATUS_VALID_DATA) continue;
+                double v = it[i].FmtValue.doubleValue;
+                if (v <= 0.0) continue;
+                const wchar_t* nm = it[i].szName;
+                DWORD pid = (wcsncmp(nm, L"pid_", 4) == 0) ? (DWORD)_wtoi(nm + 4) : 0;
+                if (pid == 0) continue;
+                wchar_t procName[64] = {};
+                PidToName(pid, procName, 64);
+                if (!procName[0]) swprintf_s(procName, L"PID %u", pid);
+                int idx = TempFindOrAdd(temps, nT, 1024, procName);
+                if (idx >= 0) temps[idx].pct += v;
             }
+        });
+        qsort(temps, nT, sizeof(TempProc), CompareTempProcDesc);
+        g_procGpuCount = min(nT, MAX_PROC_SHOW);
+        for (int j = 0; j < g_procGpuCount; ++j) {
+            wcscpy_s(g_procGpu[j].name, temps[j].name);
+            double pct = min(temps[j].pct, 100.0);
+            g_procGpu[j].pct = (float)pct;
+            swprintf_s(g_procGpu[j].absStr, L"%.1f%%", pct);
         }
     }
 
     // ---- RAM processes (\\Process(*)\\Working Set) ----
-    if (g_pdhProcRamCtr)
     {
-        DWORD sz = 0, cnt = 0;
-        PdhGetFormattedCounterArrayW(g_pdhProcRamCtr, PDH_FMT_LARGE, &sz, &cnt, nullptr);
-        if (sz > 0)
-        {
-            auto* items = (PDH_FMT_COUNTERVALUE_ITEM_W*)malloc(sz);
-            if (items)
-            {
-                MEMORYSTATUSEX ms = { sizeof(ms) };
-                GlobalMemoryStatusEx(&ms);
-                double totalBytes = (ms.ullTotalPhys > 0) ? (double)ms.ullTotalPhys : 1.0;
-
-                int nT = 0;
-                if (PdhGetFormattedCounterArrayW(g_pdhProcRamCtr, PDH_FMT_LARGE,
-                        &sz, &cnt, items) == ERROR_SUCCESS)
-                {
-                    for (DWORD i = 0; i < cnt; ++i)
-                    {
-                        if (items[i].FmtValue.CStatus != PDH_CSTATUS_VALID_DATA) continue;
-                        double bytes = (double)items[i].FmtValue.largeValue;
-                        if (bytes <= 0.0) continue;
-                        const wchar_t* nm = items[i].szName;
-                        if (wcscmp(nm, L"_Total") == 0 || wcscmp(nm, L"Idle") == 0) continue;
-                        wchar_t clean[64];
-                        NormalizeProcessName(nm, clean, 64);
-                        int idx = TempFindOrAdd(temps, nT, 1024, clean);
-                        if (idx >= 0)
-                        {
-                            temps[idx].pct    += bytes / totalBytes * 100.0;
-                            temps[idx].absVal += bytes;
-                        }
-                    }
-                }
-                free(items);
-
-                qsort(temps, nT, sizeof(TempProc), CompareTempProcDesc);
-                int n = min(nT, MAX_PROC_SHOW);
-                g_procRamCount = n;
-                for (int j = 0; j < n; ++j)
-                {
-                    wcscpy_s(g_procRam[j].name, temps[j].name);
-                    g_procRam[j].pct = (float)min(temps[j].pct, 100.0);
-                    double mb = temps[j].absVal / (1024.0 * 1024.0);
-                    if (mb >= 1024.0)
-                        swprintf_s(g_procRam[j].absStr, L"%.1f GB", mb / 1024.0);
-                    else
-                        swprintf_s(g_procRam[j].absStr, L"%.0f MB", mb);
-                }
+        MEMORYSTATUSEX ms = { sizeof(ms) };
+        GlobalMemoryStatusEx(&ms);
+        double totalBytes = (ms.ullTotalPhys > 0) ? (double)ms.ullTotalPhys : 1.0;
+        int nT = 0;
+        PdhEachArray(g_pdhProcRamCtr, PDH_FMT_LARGE, [&](auto* it, DWORD cnt) {
+            for (DWORD i = 0; i < cnt; ++i) {
+                if (it[i].FmtValue.CStatus != PDH_CSTATUS_VALID_DATA) continue;
+                double bytes = (double)it[i].FmtValue.largeValue;
+                if (bytes <= 0.0) continue;
+                const wchar_t* nm = it[i].szName;
+                if (wcscmp(nm, L"_Total") == 0 || wcscmp(nm, L"Idle") == 0) continue;
+                wchar_t clean[64];
+                NormalizeProcessName(nm, clean, 64);
+                int idx = TempFindOrAdd(temps, nT, 1024, clean);
+                if (idx >= 0) { temps[idx].pct += bytes / totalBytes * 100.0; temps[idx].absVal += bytes; }
             }
+        });
+        qsort(temps, nT, sizeof(TempProc), CompareTempProcDesc);
+        g_procRamCount = min(nT, MAX_PROC_SHOW);
+        for (int j = 0; j < g_procRamCount; ++j) {
+            wcscpy_s(g_procRam[j].name, temps[j].name);
+            g_procRam[j].pct = (float)min(temps[j].pct, 100.0);
+            double mb = temps[j].absVal / (1024.0 * 1024.0);
+            swprintf_s(g_procRam[j].absStr, mb >= 1024.0 ? L"%.1f GB" : L"%.0f MB",
+                       mb >= 1024.0 ? mb / 1024.0 : mb);
         }
     }
 
     // ---- Disk processes (\\Process(*)\\IO Data Bytes/sec) ----
-    if (g_pdhProcDiskCtr)
     {
-        DWORD sz = 0, cnt = 0;
-        PdhGetFormattedCounterArrayW(g_pdhProcDiskCtr, PDH_FMT_DOUBLE, &sz, &cnt, nullptr);
-        if (sz > 0)
-        {
-            auto* items = (PDH_FMT_COUNTERVALUE_ITEM_W*)malloc(sz);
-            if (items)
-            {
-                int nT = 0;
-                if (PdhGetFormattedCounterArrayW(g_pdhProcDiskCtr, PDH_FMT_DOUBLE,
-                        &sz, &cnt, items) == ERROR_SUCCESS)
-                {
-                    // Get actual disk utilisation (% Disk Time, 0-100).
-                    double diskPct = 0.0;
-                    if (g_pdhDiskCtr)
-                    {
-                        PDH_FMT_COUNTERVALUE val;
-                        if (PdhGetFormattedCounterValue(g_pdhDiskCtr, PDH_FMT_DOUBLE,
-                                nullptr, &val) == ERROR_SUCCESS &&
-                            val.CStatus == PDH_CSTATUS_VALID_DATA)
-                            diskPct = max(0.0, min(val.doubleValue, 100.0));
-                    }
-
-                    // Total process I/O — used to split diskPct proportionally.
-                    double totalBps = 0.0;
-                    for (DWORD i = 0; i < cnt; ++i)
-                    {
-                        if (items[i].FmtValue.CStatus != PDH_CSTATUS_VALID_DATA) continue;
-                        if (wcscmp(items[i].szName, L"_Total") == 0)
-                        {
-                            totalBps = items[i].FmtValue.doubleValue;
-                            break;
-                        }
-                    }
-                    if (totalBps <= 0.0) totalBps = 1.0;
-
-                    for (DWORD i = 0; i < cnt; ++i)
-                    {
-                        if (items[i].FmtValue.CStatus != PDH_CSTATUS_VALID_DATA) continue;
-                        double bps = items[i].FmtValue.doubleValue;
-                        if (bps <= 0.0) continue;
-                        const wchar_t* nm = items[i].szName;
-                        if (wcscmp(nm, L"_Total") == 0 || wcscmp(nm, L"Idle") == 0) continue;
-                        wchar_t clean[64];
-                        NormalizeProcessName(nm, clean, 64);
-                        int idx = TempFindOrAdd(temps, nT, 1024, clean);
-                        if (idx >= 0)
-                        {
-                            // Share of actual disk load: process fraction × real disk %.
-                            temps[idx].pct    += bps / totalBps * diskPct;
-                            temps[idx].absVal += bps;
-                        }
-                    }
-                }
-                free(items);
-
-                qsort(temps, nT, sizeof(TempProc), CompareTempProcDesc);
-                int n = min(nT, MAX_PROC_SHOW);
-                g_procDiskCount = n;
-                for (int j = 0; j < n; ++j)
-                {
-                    wcscpy_s(g_procDisk[j].name, temps[j].name);
-                    g_procDisk[j].pct = (float)min(temps[j].pct, 100.0);
-                    double mbs = temps[j].absVal / (1024.0 * 1024.0);
-                    swprintf_s(g_procDisk[j].absStr, L"%.1f MB/s", mbs);
-                }
+        double diskPct = 0.0;
+        if (g_pdhDiskCtr) {
+            PDH_FMT_COUNTERVALUE val;
+            if (PdhGetFormattedCounterValue(g_pdhDiskCtr, PDH_FMT_DOUBLE, nullptr, &val) == ERROR_SUCCESS &&
+                val.CStatus == PDH_CSTATUS_VALID_DATA)
+                diskPct = max(0.0, min(val.doubleValue, 100.0));
+        }
+        int nT = 0;
+        PdhEachArray(g_pdhProcDiskCtr, PDH_FMT_DOUBLE, [&](auto* it, DWORD cnt) {
+            double totalBps = 1.0;
+            for (DWORD i = 0; i < cnt; ++i)
+                if (it[i].FmtValue.CStatus == PDH_CSTATUS_VALID_DATA &&
+                    wcscmp(it[i].szName, L"_Total") == 0)
+                    { totalBps = it[i].FmtValue.doubleValue; if (totalBps <= 0.0) totalBps = 1.0; break; }
+            for (DWORD i = 0; i < cnt; ++i) {
+                if (it[i].FmtValue.CStatus != PDH_CSTATUS_VALID_DATA) continue;
+                double bps = it[i].FmtValue.doubleValue;
+                if (bps <= 0.0) continue;
+                const wchar_t* nm = it[i].szName;
+                if (wcscmp(nm, L"_Total") == 0 || wcscmp(nm, L"Idle") == 0) continue;
+                wchar_t clean[64];
+                NormalizeProcessName(nm, clean, 64);
+                int idx = TempFindOrAdd(temps, nT, 1024, clean);
+                if (idx >= 0) { temps[idx].pct += bps / totalBps * diskPct; temps[idx].absVal += bps; }
             }
+        });
+        qsort(temps, nT, sizeof(TempProc), CompareTempProcDesc);
+        g_procDiskCount = min(nT, MAX_PROC_SHOW);
+        for (int j = 0; j < g_procDiskCount; ++j) {
+            wcscpy_s(g_procDisk[j].name, temps[j].name);
+            g_procDisk[j].pct = (float)min(temps[j].pct, 100.0);
+            swprintf_s(g_procDisk[j].absStr, L"%.1f MB/s", temps[j].absVal / (1024.0 * 1024.0));
         }
     }
 }
@@ -2651,31 +2432,30 @@ static void UpdateLayeredContent(HWND hwnd)
             g_gpuChartRect  = { chartLeft, VEDGE + (rowH + PAD),        chartLeft + colW, VEDGE + (rowH + PAD) + rowH };
             g_diskChartRect = { chartLeft, VEDGE + 3.f * (rowH + PAD),  chartLeft + colW, VEDGE + 3.f * (rowH + PAD) + rowH };
 
+            const float titleH = g_fontSize * 1.4f;
+            const float margin = 8.f;
+
             for (int i = 0; i < NUM_CHARTS; ++i)
             {
                 float x = chartLeft;
                 float y = VEDGE + i * (rowH + PAD);
                 D2D1_RECT_F area = { x, y, x + colW, y + rowH };
 
+                auto drawChartTitle = [&](const wchar_t* name) {
+                    ID2D1SolidColorBrush* pB = nullptr;
+                    if (SUCCEEDED(g_pDCRT->CreateSolidColorBrush(D2D1::ColorF(0.f, 0.f, 0.f, 1.f), &pB))) {
+                        DrawTextEllipsis(g_pDCRT, name, (UINT32)wcslen(name), g_pChartFmtL,
+                                         { x + margin, y, x + colW - margin, y + titleH }, pB);
+                        pB->Release();
+                    }
+                };
+
                 if (i == 0 && g_cpuMode != 0)
                 {
                     if (g_cpuMode == 3)
                     {
                         // Load + Temp side by side
-                        const float titleH = g_fontSize * 1.4f;
-                        const float margin = 8.f;
-                        {
-                            ID2D1SolidColorBrush* pBrush = nullptr;
-                            if (SUCCEEDED(g_pDCRT->CreateSolidColorBrush(
-                                    D2D1::ColorF(0.f, 0.f, 0.f, 1.f), &pBrush)))
-                            {
-                                D2D1_RECT_F titleRect = { x + margin, y, x + colW - margin, y + titleH };
-                                DrawTextEllipsis(g_pDCRT, g_charts[0].name,
-                                                 (UINT32)wcslen(g_charts[0].name),
-                                                 g_pChartFmtL, titleRect, pBrush);
-                                pBrush->Release();
-                            }
-                        }
+                        drawChartTitle(g_charts[0].name);
                         float halfW  = colW / 2.f;
                         float chartY = y + titleH;
                         int miniSamples = max(2, CHART_SAMPLES / 2);
@@ -2684,20 +2464,7 @@ static void UpdateLayeredContent(HWND hwnd)
                     }
                     else
                     {
-                        const float titleH = g_fontSize * 1.4f;
-                        const float margin = 8.f;
-                        {
-                            ID2D1SolidColorBrush* pBrush = nullptr;
-                            if (SUCCEEDED(g_pDCRT->CreateSolidColorBrush(
-                                    D2D1::ColorF(0.f, 0.f, 0.f, 1.f), &pBrush)))
-                            {
-                                D2D1_RECT_F titleRect = { x + margin, y, x + colW - margin, y + titleH };
-                                DrawTextEllipsis(g_pDCRT, g_charts[0].name,
-                                                 (UINT32)wcslen(g_charts[0].name),
-                                                 g_pChartFmtL, titleRect, pBrush);
-                                pBrush->Release();
-                            }
-                        }
+                        drawChartTitle(g_charts[0].name);
                         const Chart* cores = (g_cpuMode == 1) ? g_logicalCharts  : g_physicalCharts;
                         int coreCount      = (g_cpuMode == 1) ? g_logicalCoreCount : g_physicalCoreCount;
                         if (coreCount < 1) coreCount = 1;
@@ -2719,20 +2486,7 @@ static void UpdateLayeredContent(HWND hwnd)
                         DrawChart(g_pDCRT, g_gpuTempChart, area, g_pChartFmtL, g_pChartFmtR);
                     else if (g_gpuMode == 3)
                     {
-                        const float titleH = g_fontSize * 1.4f;
-                        const float margin = 8.f;
-                        {
-                            ID2D1SolidColorBrush* pBrush = nullptr;
-                            if (SUCCEEDED(g_pDCRT->CreateSolidColorBrush(
-                                    D2D1::ColorF(0.f, 0.f, 0.f, 1.f), &pBrush)))
-                            {
-                                D2D1_RECT_F titleRect = { x + margin, y, x + colW - margin, y + titleH };
-                                DrawTextEllipsis(g_pDCRT, g_charts[1].name,
-                                                 (UINT32)wcslen(g_charts[1].name),
-                                                 g_pChartFmtL, titleRect, pBrush);
-                                pBrush->Release();
-                            }
-                        }
+                        drawChartTitle(g_charts[1].name);
                         float halfW  = colW / 2.f;
                         float chartY = y + titleH;
                         int miniSamples = max(2, CHART_SAMPLES / 2);
@@ -2741,20 +2495,7 @@ static void UpdateLayeredContent(HWND hwnd)
                     }
                     else // g_gpuMode == 4: core + VRAM + temp
                     {
-                        const float titleH = g_fontSize * 1.4f;
-                        const float margin = 8.f;
-                        {
-                            ID2D1SolidColorBrush* pBrush = nullptr;
-                            if (SUCCEEDED(g_pDCRT->CreateSolidColorBrush(
-                                    D2D1::ColorF(0.f, 0.f, 0.f, 1.f), &pBrush)))
-                            {
-                                D2D1_RECT_F titleRect = { x + margin, y, x + colW - margin, y + titleH };
-                                DrawTextEllipsis(g_pDCRT, g_charts[1].name,
-                                                 (UINT32)wcslen(g_charts[1].name),
-                                                 g_pChartFmtL, titleRect, pBrush);
-                                pBrush->Release();
-                            }
-                        }
+                        drawChartTitle(g_charts[1].name);
                         float thirdW = colW / 3.f;
                         float chartY = y + titleH;
                         int miniSamples = max(2, CHART_SAMPLES / 3);
@@ -2904,15 +2645,8 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
         GetRamName (g_charts[2].name, 256);
         GetDiskName(g_charts[3].name, 256);
 
-        // GPU VRAM and temperature chart names
-        {
-            wchar_t gpuBuf[256];
-            GetGpuName(gpuBuf, 256);
-            swprintf_s(g_gpuVramChart.name, L"%s VRAM", gpuBuf);
-            swprintf_s(g_gpuTempChart.name, L"%s Temp", gpuBuf);
-        }
-
-        // CPU temperature chart name
+        swprintf_s(g_gpuVramChart.name, L"%s VRAM", g_charts[1].name);
+        swprintf_s(g_gpuTempChart.name, L"%s Temp", g_charts[1].name);
         swprintf_s(g_cpuTempChart.name, L"%s Temp", g_charts[0].name);
 
         DetectCoreTopology();
@@ -3323,7 +3057,6 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
 
         if (g_draggingDiv)
         {
-            int w = rc.right - rc.left;
             g_dividerX = max(80.f, min((float)mx, g_dividerX2 - 120.f));
             UpdateLayeredContent(hwnd);
         }
@@ -3398,31 +3131,13 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
 
     case WM_LBUTTONUP:
     {
-        bool wasDivV  = g_draggingDiv;
-        bool wasDivV2 = g_draggingDiv2;
-        bool wasDivH  = g_draggingDivH;
-
-        if (g_draggingDiv)
-        {
-            g_draggingDiv = false;
-            ReleaseCapture();
-            SaveWindowState(hwnd);
-        }
-        else if (g_draggingDiv2)
-        {
-            g_draggingDiv2 = false;
-            ReleaseCapture();
-            SaveWindowState(hwnd);
-        }
-        else if (g_draggingDivH)
-        {
-            g_draggingDivH = false;
-            ReleaseCapture();
-        }
+        bool wasDragging = g_draggingDiv || g_draggingDiv2 || g_draggingDivH;
+        if      (g_draggingDiv)  { g_draggingDiv  = false; ReleaseCapture(); SaveWindowState(hwnd); }
+        else if (g_draggingDiv2) { g_draggingDiv2 = false; ReleaseCapture(); SaveWindowState(hwnd); }
+        else if (g_draggingDivH) { g_draggingDivH = false; ReleaseCapture(); }
 
         // Link click: only if no drag occurred and mouse is on a visible link
-        if (!wasDivV && !wasDivV2 && !wasDivH &&
-            g_habrHover >= 0 && g_habrHover < g_habrVisible)
+        if (!wasDragging && g_habrHover >= 0 && g_habrHover < g_habrVisible)
         {
             int idx = g_habrHover;
             char url[512] = {};
