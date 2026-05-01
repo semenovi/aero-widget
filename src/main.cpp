@@ -169,7 +169,7 @@ static D2D1_RECT_F  g_cpuChartRect = {};  // CPU row rect (local coords), for cl
 // -----------------------------------------------------------------------
 // GPU mode
 // -----------------------------------------------------------------------
-static int          g_gpuMode       = 0; // 0=core load, 1=VRAM %, 2=temp, 3=core+VRAM
+static int          g_gpuMode       = 0; // 0=core load, 1=VRAM %, 2=temp, 3=core+VRAM, 4=core+VRAM+temp
 static Chart        g_gpuVramChart  = {};
 static Chart        g_gpuTempChart  = {};
 static PDH_HCOUNTER g_pdhGpuTempCtr = NULL;
@@ -336,7 +336,8 @@ static void DrawTextEllipsis(ID2D1RenderTarget* rt,
 static void DrawChart(ID2D1RenderTarget* rt, const Chart& c,
                       D2D1_RECT_F area,
                       IDWriteTextFormat* fmtL, IDWriteTextFormat* fmtR,
-                      int maxSamples = CHART_SAMPLES)
+                      int maxSamples = CHART_SAMPLES,
+                      bool absOnly = false)
 {
     const float margin = 8.f;
     const float labelH = g_fontSize * 1.4f;
@@ -352,9 +353,11 @@ static void DrawChart(ID2D1RenderTarget* rt, const Chart& c,
     wchar_t valBuf[128] = {};
     if (fmtR)
     {
-        if (c.displayAbsStr[0])
+        if (absOnly && c.displayAbsStr[0])
+            wcscpy_s(valBuf, c.displayAbsStr);
+        else if (!absOnly && c.displayAbsStr[0])
             swprintf_s(valBuf, L"%.1f%% / %s", c.displayCurrent * 100.0, c.displayAbsStr);
-        else
+        else if (!absOnly)
             swprintf_s(valBuf, L"%.1f%%", c.displayCurrent * 100.0);
     }
 
@@ -872,7 +875,7 @@ static void LoadConfig()
         g_cpuMode = cpuMode;
 
     int gpuMode = 0;
-    if (JsonInt(buf, "gpu_mode", &gpuMode) && gpuMode >= 0 && gpuMode <= 3)
+    if (JsonInt(buf, "gpu_mode", &gpuMode) && gpuMode >= 0 && gpuMode <= 4)
         g_gpuMode = gpuMode;
 
     int diskMode = 0;
@@ -2714,7 +2717,7 @@ static void UpdateLayeredContent(HWND hwnd)
                         DrawChart(g_pDCRT, g_gpuVramChart, area, g_pChartFmtL, g_pChartFmtR);
                     else if (g_gpuMode == 2)
                         DrawChart(g_pDCRT, g_gpuTempChart, area, g_pChartFmtL, g_pChartFmtR);
-                    else
+                    else if (g_gpuMode == 3)
                     {
                         const float titleH = g_fontSize * 1.4f;
                         const float margin = 8.f;
@@ -2735,6 +2738,31 @@ static void UpdateLayeredContent(HWND hwnd)
                         int miniSamples = max(2, CHART_SAMPLES / 2);
                         DrawChart(g_pDCRT, g_charts[1],    { x,         chartY, x + halfW, y + rowH }, nullptr, g_pChartFmtR, miniSamples);
                         DrawChart(g_pDCRT, g_gpuVramChart, { x + halfW, chartY, x + colW,  y + rowH }, nullptr, g_pChartFmtR, miniSamples);
+                    }
+                    else // g_gpuMode == 4: core + VRAM + temp
+                    {
+                        const float titleH = g_fontSize * 1.4f;
+                        const float margin = 8.f;
+                        {
+                            ID2D1SolidColorBrush* pBrush = nullptr;
+                            if (SUCCEEDED(g_pDCRT->CreateSolidColorBrush(
+                                    D2D1::ColorF(0.f, 0.f, 0.f, 1.f), &pBrush)))
+                            {
+                                D2D1_RECT_F titleRect = { x + margin, y, x + colW - margin, y + titleH };
+                                DrawTextEllipsis(g_pDCRT, g_charts[1].name,
+                                                 (UINT32)wcslen(g_charts[1].name),
+                                                 g_pChartFmtL, titleRect, pBrush);
+                                pBrush->Release();
+                            }
+                        }
+                        float thirdW = colW / 3.f;
+                        float chartY = y + titleH;
+                        int miniSamples = max(2, CHART_SAMPLES / 3);
+                        Chart coreOnly = g_charts[1];
+                        coreOnly.displayAbsStr[0] = L'\0';
+                        DrawChart(g_pDCRT, coreOnly,       { x,               chartY, x + thirdW,     y + rowH }, nullptr, g_pChartFmtR, miniSamples);
+                        DrawChart(g_pDCRT, g_gpuVramChart, { x + thirdW,      chartY, x + 2.f*thirdW, y + rowH }, nullptr, g_pChartFmtR, miniSamples);
+                        DrawChart(g_pDCRT, g_gpuTempChart, { x + 2.f*thirdW,  chartY, x + colW,       y + rowH }, nullptr, g_pChartFmtR, miniSamples, true);
                     }
                 }
                 else if (i == 3 && g_diskMode > 0)
@@ -3233,8 +3261,8 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
         else if ((float)mx >= g_gpuChartRect.left && (float)mx <= g_gpuChartRect.right &&
                  (float)my >= g_gpuChartRect.top  && (float)my <= g_gpuChartRect.bottom)
         {
-            // Cycle GPU mode: 0 (core) → 1 (VRAM %) → 2 (temp) → 3 (core+VRAM) → 0
-            g_gpuMode = (g_gpuMode + 1) % 4;
+            // Cycle GPU mode: 0 (core) → 1 (VRAM %) → 2 (temp) → 3 (core+VRAM) → 4 (core+VRAM+temp) → 0
+            g_gpuMode = (g_gpuMode + 1) % 5;
             SaveWindowState(hwnd);
             UpdateLayeredContent(hwnd);
         }
