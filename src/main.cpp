@@ -29,7 +29,12 @@
 #pragma comment(lib, "oleaut32.lib")
 #pragma comment(lib, "wbemuuid.lib")
 
-#define WM_TRAYICON  (WM_APP + 1)
+#include <iphlpapi.h>
+#pragma comment(lib, "iphlpapi.lib")
+
+#define WM_TRAYICON   (WM_APP + 1)
+#define WM_FETCH_IP   (WM_APP + 2)
+#define WM_REDRAW_IP  (WM_APP + 3)
 #define ID_TRAY_EXIT      1001
 #define ID_TRAY_AUTOSTART 1002
 static NOTIFYICONDATAW g_nid = {};
@@ -254,6 +259,11 @@ static int g_hoveredProcRow  = -1; // entry row index within tile; -1 = none/tit
 static float g_dividerX2    = 0.f;
 static bool  g_draggingDiv2 = false;
 static float g_cfgDividerX2 = -1.f;
+
+// Second horizontal divider (between IP panel and Habr, within left column)
+static float g_dividerY2     = 0.f;
+static bool  g_draggingDivH2 = false;
+static float g_cfgDividerY2  = -1.f;
 
 // PDH process counters (added to g_pdhQuery in WM_CREATE)
 static PDH_HCOUNTER g_pdhProcCpuCtr  = NULL;
@@ -571,6 +581,17 @@ static CRITICAL_SECTION g_weatherCS;
 static char             g_location[256] = "";
 static HANDLE           g_weatherThread = NULL;
 
+// -----------------------------------------------------------------------
+// Public IP
+// -----------------------------------------------------------------------
+static wchar_t          g_ipStr[64]         = L"";
+static CRITICAL_SECTION g_ipCS;
+static HANDLE           g_ipThread          = NULL;
+static HANDLE           g_ipWatchThread     = NULL;
+static HANDLE           g_ipWatchStop       = NULL; // manual-reset event; signals watch thread to exit
+static HWND             g_hwndForIp         = NULL;
+static volatile LONG    g_ipFetchPending    = 0; // debounce: at most one WM_FETCH_IP queued
+
 // Autostart
 static bool g_autostart = false;
 
@@ -705,6 +726,7 @@ static void SaveWindowState(HWND hwnd)
         "    \"divider_x\": %.2f,\n"
         "    \"divider_y\": %.2f,\n"
         "    \"divider_x2\": %.2f,\n"
+        "    \"divider_y2\": %.2f,\n"
         "    \"cpu_mode\": %d,\n"
         "    \"gpu_mode\": %d,\n"
         "    \"ram_mode\": %d,\n"
@@ -719,7 +741,7 @@ static void SaveWindowState(HWND hwnd)
         "    \"proc_abs_disk\": %d\n"
         "}\n",
         escaped, monL, monT, relX, relY, winW, winH,
-        (double)g_dividerX, (double)g_dividerY, (double)g_dividerX2,
+        (double)g_dividerX, (double)g_dividerY, (double)g_dividerX2, (double)g_dividerY2,
         g_cpuMode, g_gpuMode, g_ramMode, g_diskMode, g_diskSubMode,
         (double)g_fontScale,
         g_autostart ? "true" : "false",
@@ -844,6 +866,8 @@ static void LoadConfig()
         g_cfgDividerY = (float)dv;
     if (JsonDouble(buf, "divider_x2", &dv) && dv > 0.0)
         g_cfgDividerX2 = (float)dv;
+    if (JsonDouble(buf, "divider_y2", &dv) && dv > 0.0)
+        g_cfgDividerY2 = (float)dv;
 
     int habrMin = 0;
     if (JsonInt(buf, "habr_refresh_minutes", &habrMin) && habrMin > 0)
@@ -1427,6 +1451,148 @@ static void StartWeatherFetch()
 {
     if (g_weatherThread) { CloseHandle(g_weatherThread); g_weatherThread = NULL; }
     g_weatherThread = CreateThread(nullptr, 0, WeatherThreadProc, nullptr, 0, nullptr);
+}
+
+// -----------------------------------------------------------------------
+// Public IP fetch
+// -----------------------------------------------------------------------
+// Validate that s looks like an IPv4/IPv6 address (no HTML, no spaces beyond trimming)
+static bool IsValidIp(const char* s)
+{
+    if (!s || !*s) return false;
+    int len = (int)strlen(s);
+    if (len < 7 || len > 45) return false;
+    for (int i = 0; i < len; i++)
+    {
+        char c = s[i];
+        if (!((c >= '0' && c <= '9') || c == '.' || c == ':' ||
+              (c >= 'a' && c <= 'f') || (c >= 'A' && c <= 'F')))
+            return false;
+    }
+    return true;
+}
+
+// Trim trailing whitespace in-place, return new length
+static int TrimRight(char* s)
+{
+    int len = (int)strlen(s);
+    while (len > 0 && (s[len-1] == '\n' || s[len-1] == '\r' || s[len-1] == ' ' || s[len-1] == '\t'))
+        s[--len] = '\0';
+    return len;
+}
+
+// lParam: 0 = timer/initial, 1 = interface-changed (adds reconnect delay)
+static DWORD WINAPI IpThreadProc(LPVOID lParam)
+{
+    if (lParam) Sleep(3000); // wait for VPN to finish reconnecting
+
+    // Fallback list: services that return plain-text IP.
+    // Ordered so that services accessible in Russia without VPN come first;
+    // when furious is active, all go through its proxy anyway.
+    static const wchar_t* kServices[] = {
+        L"https://api.ipify.org",
+        L"https://checkip.amazonaws.com",
+        L"https://ip.sb",
+        L"https://icanhazip.com",
+        L"https://ifconfig.me/ip",
+    };
+
+    wchar_t wip[64] = L"";
+    for (int i = 0; i < (int)(sizeof(kServices)/sizeof(kServices[0])); i++)
+    {
+        char* body = HttpGetUrl(kServices[i], L"AeroWidget/1.0");
+        if (body)
+        {
+            TrimRight(body);
+            if (IsValidIp(body))
+                MultiByteToWideChar(CP_UTF8, 0, body, -1, wip, 64);
+            free(body);
+        }
+        if (wip[0]) break;
+    }
+
+    EnterCriticalSection(&g_ipCS);
+    wcscpy_s(g_ipStr, wip[0] ? wip : L"—");
+    LeaveCriticalSection(&g_ipCS);
+
+    if (g_hwndForIp) PostMessageW(g_hwndForIp, WM_REDRAW_IP, 0, 0);
+    return 0;
+}
+
+static void StartIpFetch(LPVOID cause = nullptr)
+{
+    if (g_ipThread)
+    {
+        if (WaitForSingleObject(g_ipThread, 0) == WAIT_TIMEOUT)
+            return; // previous fetch still running, skip
+        CloseHandle(g_ipThread);
+        g_ipThread = NULL;
+    }
+    g_ipThread = CreateThread(nullptr, 0, IpThreadProc, cause, 0, nullptr);
+}
+
+// Watch thread: blocks on NotifyAddrChange (iphlpapi, no winsock needed).
+// When a local address changes (VPN up/down), posts WM_FETCH_IP with lParam=1.
+static DWORD WINAPI IpWatchThreadProc(LPVOID)
+{
+    while (true)
+    {
+        HANDLE hNet = INVALID_HANDLE_VALUE;
+        OVERLAPPED ov = {};
+        ov.hEvent = CreateEventW(nullptr, FALSE, FALSE, nullptr);
+        if (!ov.hEvent) break;
+
+        DWORD ret = NotifyAddrChange(&hNet, &ov);
+        if (ret == ERROR_IO_PENDING)
+        {
+            HANDLE wait[2] = { ov.hEvent, g_ipWatchStop };
+            DWORD w = WaitForMultipleObjects(2, wait, FALSE, INFINITE);
+            CloseHandle(ov.hEvent);
+            if (w != WAIT_OBJECT_0) break; // stop event or error — exit thread
+            // Address changed — debounce
+            if (InterlockedCompareExchange(&g_ipFetchPending, 1, 0) == 0)
+                if (g_hwndForIp) PostMessageW(g_hwndForIp, WM_FETCH_IP, 1, 0);
+        }
+        else
+        {
+            CloseHandle(ov.hEvent);
+            Sleep(5000); // unexpected error, avoid tight loop
+        }
+    }
+    return 0;
+}
+
+static void StartIpWatchThread()
+{
+    g_ipWatchStop   = CreateEventW(nullptr, TRUE, FALSE, nullptr); // manual-reset
+    g_ipWatchThread = CreateThread(nullptr, 0, IpWatchThreadProc, nullptr, 0, nullptr);
+}
+
+// -----------------------------------------------------------------------
+// Draw IP panel
+// -----------------------------------------------------------------------
+static void DrawIpPanel(ID2D1RenderTarget* rt, D2D1_RECT_F area)
+{
+    if (!g_pChartFmtL) return;
+    ID2D1SolidColorBrush* pBrush = nullptr;
+    if (FAILED(rt->CreateSolidColorBrush(D2D1::ColorF(0.f, 0.f, 0.f, 1.f), &pBrush))) return;
+
+    const float lh = g_fontSize * 1.4f;
+    float y = area.top;
+
+    wchar_t ip[64];
+    EnterCriticalSection(&g_ipCS);
+    wcscpy_s(ip, g_ipStr[0] ? g_ipStr : L"…");
+    LeaveCriticalSection(&g_ipCS);
+
+    wchar_t text[80];
+    swprintf_s(text, L"IP  %s", ip);
+    if (y + lh <= area.bottom)
+    {
+        D2D1_RECT_F r = { area.left, y, area.right, y + lh };
+        DrawTextEllipsis(rt, text, (UINT32)wcslen(text), g_pChartFmtL, r, pBrush);
+    }
+    pBrush->Release();
 }
 
 // -----------------------------------------------------------------------
@@ -2668,7 +2834,7 @@ static void UpdateLayeredContent(HWND hwnd)
             DrawWeather(g_pDCRT, wd, weatherArea);
         }
 
-        // --- Horizontal divider (within left panel) ---
+        // --- Horizontal divider 1 (weather / IP) ---
         {
             ID2D1SolidColorBrush* pDivH = nullptr;
             if (SUCCEEDED(g_pDCRT->CreateSolidColorBrush(D2D1::ColorF(0.f, 0.f, 0.f, 1.f), &pDivH)))
@@ -2681,10 +2847,30 @@ static void UpdateLayeredContent(HWND hwnd)
             }
         }
 
-        // --- Habr panel (bottom-left: below horizontal divider) ---
-        if (g_dividerX > 2.f * PAD && g_dividerY + PAD < (float)h - VEDGE)
+        // --- IP panel (between dividerY and dividerY2) ---
+        if (g_dividerX > 2.f * PAD && g_dividerY + PAD < g_dividerY2 - PAD)
         {
-            D2D1_RECT_F habrArea = { PAD, g_dividerY + PAD,
+            D2D1_RECT_F ipArea = { PAD, g_dividerY + PAD, g_dividerX - PAD, g_dividerY2 - PAD };
+            DrawIpPanel(g_pDCRT, ipArea);
+        }
+
+        // --- Horizontal divider 2 (IP / Habr) ---
+        {
+            ID2D1SolidColorBrush* pDivH2 = nullptr;
+            if (SUCCEEDED(g_pDCRT->CreateSolidColorBrush(D2D1::ColorF(0.f, 0.f, 0.f, 1.f), &pDivH2)))
+            {
+                g_pDCRT->DrawLine(
+                    D2D1::Point2F(PAD, g_dividerY2),
+                    D2D1::Point2F(g_dividerX - PAD, g_dividerY2),
+                    pDivH2, 0.75f);
+                pDivH2->Release();
+            }
+        }
+
+        // --- Habr panel (bottom-left: below horizontal divider 2) ---
+        if (g_dividerX > 2.f * PAD && g_dividerY2 + PAD < (float)h - VEDGE)
+        {
+            D2D1_RECT_F habrArea = { PAD, g_dividerY2 + PAD,
                                      g_dividerX - PAD, (float)h - VEDGE };
             DrawHabrPanel(g_pDCRT, habrArea, g_habrHover);
         }
@@ -3127,16 +3313,27 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
                 g_dividerX2 = max(g_dividerX + 120.f, min(g_cfgDividerX2, (float)w - 80.f));
             else
                 g_dividerX2 = g_dividerX + ((float)w - g_dividerX) * 0.60f;
+
+            if (g_cfgDividerY2 > 0.f)
+                g_dividerY2 = max(g_dividerY + 30.f, min(g_cfgDividerY2, (float)h - 60.f));
+            else
+                g_dividerY2 = g_dividerY + ((float)h - g_dividerY) * 0.20f;
         }
 
-        // Config already loaded in WinMain; kick weather, Habr, and CPU temp fetches
+        // Config already loaded in WinMain; kick weather, Habr, CPU temp, and IP fetches
         StartWeatherFetch();
         StartHabrFetch();
         StartCpuTempThread();
 
+        InitializeCriticalSection(&g_ipCS);
+        g_hwndForIp = hwnd;
+        StartIpFetch();
+        StartIpWatchThread();
+
         SetTimer(hwnd, 1, 50, nullptr);                           // ~20 fps chart update
         SetTimer(hwnd, 2, 600000, nullptr);                        // weather refresh every 10 min
         SetTimer(hwnd, 3, g_habrRefreshMin * 60000, nullptr);     // Habr refresh
+        SetTimer(hwnd, 4, 60000, nullptr);                         // IP refresh every 1 min
 
         UpdateLayeredContent(hwnd);
 
@@ -3202,6 +3399,10 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
         {
             StartHabrFetch();
         }
+        else if (wParam == 4)
+        {
+            StartIpFetch((LPVOID)0); // timer-triggered, no delay
+        }
         return 0;
     }
 
@@ -3245,9 +3446,14 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
             abs(my - (int)g_dividerY) <= DIV_HIT)
             return HTCLIENT;
 
-        // Habr panel (below horizontal divider, left of vertical divider)
+        // Horizontal divider 2 (IP / Habr)
         if (mx >= 0 && mx < (int)g_dividerX - DIV_HIT &&
-            my > (int)g_dividerY + DIV_HIT && my < wh - (int)VEDGE)
+            abs(my - (int)g_dividerY2) <= DIV_HIT)
+            return HTCLIENT;
+
+        // Habr panel (below horizontal divider 2, left of vertical divider)
+        if (mx >= 0 && mx < (int)g_dividerX - DIV_HIT &&
+            my > (int)g_dividerY2 + DIV_HIT && my < wh - (int)VEDGE)
             return HTCLIENT;
 
         // CPU chart row → client so click fires
@@ -3298,9 +3504,10 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
                 SetCursor(LoadCursorW(NULL, IDC_SIZEWE));
                 return TRUE;
             }
-            // Horizontal divider
+            // Horizontal dividers
             if (mx >= 0 && mx < (int)g_dividerX - DIV_HIT &&
-                abs(my - (int)g_dividerY) <= DIV_HIT)
+                (abs(my - (int)g_dividerY) <= DIV_HIT ||
+                 abs(my - (int)g_dividerY2) <= DIV_HIT))
             {
                 SetCursor(LoadCursorW(NULL, IDC_SIZENS));
                 return TRUE;
@@ -3334,6 +3541,12 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
                  abs(my - (int)g_dividerY) <= DIV_HIT)
         {
             g_draggingDivH = true;
+            SetCapture(hwnd);
+        }
+        else if (mx >= 0 && mx < (int)g_dividerX - DIV_HIT &&
+                 abs(my - (int)g_dividerY2) <= DIV_HIT)
+        {
+            g_draggingDivH2 = true;
             SetCapture(hwnd);
         }
         else if ((float)mx >= g_cpuChartRect.left && (float)mx <= g_cpuChartRect.right &&
@@ -3435,7 +3648,13 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
         else if (g_draggingDivH)
         {
             int h = rc.bottom - rc.top;
-            g_dividerY = max(60.f, min((float)my, (float)h - 60.f));
+            g_dividerY = max(60.f, min((float)my, g_dividerY2 - 30.f));
+            UpdateLayeredContent(hwnd);
+        }
+        else if (g_draggingDivH2)
+        {
+            int h = rc.bottom - rc.top;
+            g_dividerY2 = max(g_dividerY + 30.f, min((float)my, (float)h - 60.f));
             UpdateLayeredContent(hwnd);
         }
         else
@@ -3497,10 +3716,11 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
 
     case WM_LBUTTONUP:
     {
-        bool wasDragging = g_draggingDiv || g_draggingDiv2 || g_draggingDivH;
-        if      (g_draggingDiv)  { g_draggingDiv  = false; ReleaseCapture(); SaveWindowState(hwnd); }
-        else if (g_draggingDiv2) { g_draggingDiv2 = false; ReleaseCapture(); SaveWindowState(hwnd); }
-        else if (g_draggingDivH) { g_draggingDivH = false; ReleaseCapture(); }
+        bool wasDragging = g_draggingDiv || g_draggingDiv2 || g_draggingDivH || g_draggingDivH2;
+        if      (g_draggingDiv)   { g_draggingDiv   = false; ReleaseCapture(); SaveWindowState(hwnd); }
+        else if (g_draggingDiv2)  { g_draggingDiv2  = false; ReleaseCapture(); SaveWindowState(hwnd); }
+        else if (g_draggingDivH)  { g_draggingDivH  = false; ReleaseCapture(); SaveWindowState(hwnd); }
+        else if (g_draggingDivH2) { g_draggingDivH2 = false; ReleaseCapture(); SaveWindowState(hwnd); }
 
         // Link click: only if no drag occurred and mouse is on a visible link
         if (!wasDragging && g_habrHover >= 0 && g_habrHover < g_habrVisible)
@@ -3533,6 +3753,7 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
             int h = rc.bottom - rc.top;
             g_dividerX  = max(80.f,  min(g_dividerX,  (float)w - 80.f));
             g_dividerY  = max(60.f,  min(g_dividerY,  (float)h - 60.f));
+            g_dividerY2 = max(g_dividerY + 30.f, min(g_dividerY2, (float)h - 60.f));
             g_dividerX2 = max(g_dividerX + 120.f, min(g_dividerX2, (float)w - 80.f));
             UpdateLayeredContent(hwnd);
         }
@@ -3627,11 +3848,31 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
     }
 
     // ------------------------------------------------------------------
+    case WM_FETCH_IP:
+        InterlockedExchange(&g_ipFetchPending, 0); // clear debounce flag
+        StartIpFetch((LPVOID)lParam);              // lParam: 0=timer, 1=interface-changed
+        return 0;
+
+    case WM_REDRAW_IP:
+        UpdateLayeredContent(hwnd);
+        return 0;
+
+    // ------------------------------------------------------------------
     case WM_DESTROY:
         SaveWindowState(hwnd);
         KillTimer(hwnd, 1);
         KillTimer(hwnd, 2);
         KillTimer(hwnd, 3);
+        KillTimer(hwnd, 4);
+        g_hwndForIp = NULL;
+        if (g_ipWatchStop)
+        {
+            SetEvent(g_ipWatchStop);
+            if (g_ipWatchThread) { WaitForSingleObject(g_ipWatchThread, 3000); CloseHandle(g_ipWatchThread); g_ipWatchThread = NULL; }
+            CloseHandle(g_ipWatchStop); g_ipWatchStop = NULL;
+        }
+        if (g_ipThread) { WaitForSingleObject(g_ipThread, 2000); CloseHandle(g_ipThread); g_ipThread = NULL; }
+        DeleteCriticalSection(&g_ipCS);
         if (g_weatherThread)
         {
             WaitForSingleObject(g_weatherThread, 2000);
