@@ -216,6 +216,32 @@ static D2D1_RECT_F  g_diskChartRect  = {};
 static D2D1_RECT_F  g_weatherRect    = {};
 
 // -----------------------------------------------------------------------
+// Column layout configuration
+// Panel type names: "weather", "ip", "rss",
+//   "cpu_chart", "gpu_chart", "ram_chart", "disk_chart",
+//   "cpu_proc",  "gpu_proc",  "ram_proc",  "disk_proc", "none"
+// -----------------------------------------------------------------------
+static const int MAX_COLS = 8;
+static const int MAX_PANELS_PER_COL = 8;
+
+static int  g_colCount = 3;
+static char g_colPanels[MAX_COLS][MAX_PANELS_PER_COL][32];
+static int  g_colPanelCount[MAX_COLS];
+
+static float g_colDivX[MAX_COLS];                          // X of divider after column k
+static bool  g_colDivXSet[MAX_COLS];                       // loaded from config?
+static float g_colDivY[MAX_COLS][MAX_PANELS_PER_COL];      // Y between row r and r+1 in col c
+static bool  g_colDivYSet[MAX_COLS][MAX_PANELS_PER_COL];
+
+static int g_draggingColDivIdx = -1;   // which vertical divider is dragged (-1 = none)
+static int g_draggingRowDivCol = -1;   // column of dragged horizontal divider (-1 = none)
+static int g_draggingRowDivIdx = -1;   // row index of dragged horizontal divider
+
+// RSS panel rects collected each frame for link hit-testing
+static D2D1_RECT_F g_rssPanelRects[MAX_COLS * MAX_PANELS_PER_COL];
+static int         g_rssPanelRectCount = 0;
+
+// -----------------------------------------------------------------------
 // Per-process top lists
 // -----------------------------------------------------------------------
 struct ProcEntry {
@@ -255,16 +281,6 @@ static D2D1_RECT_F g_procListRects[NUM_CHARTS] = {};
 static int g_hoveredProcList = -1; // 0..3 = tile index; -1 = none
 static int g_hoveredProcRow  = -1; // entry row index within tile; -1 = none/title
 
-// Second vertical divider (between charts and process lists)
-static float g_dividerX2    = 0.f;
-static bool  g_draggingDiv2 = false;
-static float g_cfgDividerX2 = -1.f;
-
-// Second horizontal divider (between IP panel and Habr, within left column)
-static float g_dividerY2     = 0.f;
-static bool  g_draggingDivH2 = false;
-static float g_cfgDividerY2  = -1.f;
-
 // PDH process counters (added to g_pdhQuery in WM_CREATE)
 static PDH_HCOUNTER g_pdhProcCpuCtr  = NULL;
 static PDH_HCOUNTER g_pdhProcRamCtr  = NULL;
@@ -276,6 +292,98 @@ static void PushChartValue(Chart& c, double v)
     c.head  = (c.head + 1) % CHART_SAMPLES;
     if (c.count < CHART_SAMPLES) c.count++;
     c.current = v;
+}
+
+// Returns chart data-type index for a panel type string (0=cpu..3=disk; -1=not a chart).
+static int ChartPanelIdx(const char* t)
+{
+    if (!t) return -1;
+    if (strcmp(t, "cpu_chart") == 0) return 0;
+    if (strcmp(t, "gpu_chart") == 0) return 1;
+    if (strcmp(t, "ram_chart") == 0) return 2;
+    if (strcmp(t, "disk_chart") == 0) return 3;
+    return -1;
+}
+
+// Returns process-list data-type index (0=cpu..3=disk; -1=not a proc panel).
+static int ProcPanelIdx(const char* t)
+{
+    if (!t) return -1;
+    if (strcmp(t, "cpu_proc")  == 0) return 0;
+    if (strcmp(t, "gpu_proc")  == 0) return 1;
+    if (strcmp(t, "ram_proc")  == 0) return 2;
+    if (strcmp(t, "disk_proc") == 0) return 3;
+    return -1;
+}
+
+// Parse pipe-separated panel list "a|b|c" into out array; returns count.
+static int ParsePanelList(const char* str, char out[][32], int maxCount)
+{
+    int count = 0;
+    const char* p = str;
+    while (*p && count < maxCount)
+    {
+        const char* end = strchr(p, '|');
+        int len = end ? (int)(end - p) : (int)strlen(p);
+        if (len > 0 && len < 32)
+        {
+            memcpy(out[count], p, len);
+            out[count][len] = '\0';
+            count++;
+        }
+        if (!end) break;
+        p = end + 1;
+    }
+    return count;
+}
+
+// Set up the default 3-column layout (weather/ip/rss | charts | proc lists).
+static void SetDefaultLayout()
+{
+    g_colCount = 3;
+    g_colPanelCount[0] = 3;
+    strcpy_s(g_colPanels[0][0], "weather");
+    strcpy_s(g_colPanels[0][1], "ip");
+    strcpy_s(g_colPanels[0][2], "rss");
+    g_colPanelCount[1] = 4;
+    strcpy_s(g_colPanels[1][0], "cpu_chart");
+    strcpy_s(g_colPanels[1][1], "gpu_chart");
+    strcpy_s(g_colPanels[1][2], "ram_chart");
+    strcpy_s(g_colPanels[1][3], "disk_chart");
+    g_colPanelCount[2] = 4;
+    strcpy_s(g_colPanels[2][0], "cpu_proc");
+    strcpy_s(g_colPanels[2][1], "gpu_proc");
+    strcpy_s(g_colPanels[2][2], "ram_proc");
+    strcpy_s(g_colPanels[2][3], "disk_proc");
+}
+
+// Initialize dividers to auto-spaced defaults (for any not loaded from config).
+static void InitDividers(int w, int h)
+{
+    for (int k = 0; k < g_colCount - 1; k++)
+    {
+        if (!g_colDivXSet[k])
+            g_colDivX[k] = (float)w * (float)(k + 1) / (float)g_colCount;
+        // Clamp: ensure min 80px margin between dividers and edges
+        float minX = 80.f + k * 80.f;
+        float maxX = (float)w - 80.f - (g_colCount - 2 - k) * 80.f;
+        g_colDivX[k] = max(minX, min(g_colDivX[k], maxX));
+        // Enforce ordering
+        if (k > 0) g_colDivX[k] = max(g_colDivX[k - 1] + 80.f, g_colDivX[k]);
+    }
+    for (int c = 0; c < g_colCount; c++)
+    {
+        int n = g_colPanelCount[c];
+        for (int r = 0; r < n - 1; r++)
+        {
+            if (!g_colDivYSet[c][r])
+                g_colDivY[c][r] = (float)(int)VEDGE + ((float)h - 2.f * (float)(int)VEDGE) * (float)(r + 1) / (float)n;
+            float minY = (float)(int)VEDGE + 30.f + r * 30.f;
+            float maxY = (float)h - (float)(int)VEDGE - 30.f - (n - 2 - r) * 30.f;
+            g_colDivY[c][r] = max(minY, min(g_colDivY[c][r], maxY));
+            if (r > 0) g_colDivY[c][r] = max(g_colDivY[c][r - 1] + 30.f, g_colDivY[c][r]);
+        }
+    }
 }
 
 static void SampleProcesses(); // forward declaration
@@ -531,17 +639,7 @@ static void DrawProcessList(ID2D1RenderTarget* rt,
     pBrush->Release();
 }
 
-// -----------------------------------------------------------------------
-// Divider
-// -----------------------------------------------------------------------
-static float g_dividerX     = 0.f;
-static bool  g_draggingDiv  = false;
-
-// Horizontal divider (within left/weather+habr column)
-static float g_dividerY     = 0.f;
-static bool  g_draggingDivH = false;
-
-static constexpr int DIV_HIT = 4; // px hit area around divider
+static constexpr int DIV_HIT = 4; // px hit area around dividers
 
 // -----------------------------------------------------------------------
 // Habr feed
@@ -629,8 +727,6 @@ static int   g_cfgWinX        = CFG_UNSET;
 static int   g_cfgWinY        = CFG_UNSET;
 static int   g_cfgWinW        = -1;
 static int   g_cfgWinH        = -1;
-static float g_cfgDividerX    = -1.f;
-static float g_cfgDividerY    = -1.f;
 
 // -----------------------------------------------------------------------
 // Config
@@ -724,10 +820,6 @@ static void SaveWindowState(HWND hwnd)
         "    \"win_y\": %d,\n"
         "    \"win_w\": %d,\n"
         "    \"win_h\": %d,\n"
-        "    \"divider_x\": %.2f,\n"
-        "    \"divider_y\": %.2f,\n"
-        "    \"divider_x2\": %.2f,\n"
-        "    \"divider_y2\": %.2f,\n"
         "    \"cpu_mode\": %d,\n"
         "    \"gpu_mode\": %d,\n"
         "    \"ram_mode\": %d,\n"
@@ -739,10 +831,9 @@ static void SaveWindowState(HWND hwnd)
         "    \"proc_abs_cpu\": %d,\n"
         "    \"proc_abs_gpu\": %d,\n"
         "    \"proc_abs_ram\": %d,\n"
-        "    \"proc_abs_disk\": %d\n"
-        "}\n",
+        "    \"proc_abs_disk\": %d,\n"
+        "    \"col_count\": %d,\n",
         escaped, monL, monT, relX, relY, winW, winH,
-        (double)g_dividerX, (double)g_dividerY, (double)g_dividerX2, (double)g_dividerY2,
         g_cpuMode, g_gpuMode, g_ramMode, g_diskMode, g_diskSubMode,
         (double)g_fontScale,
         g_autostart ? "true" : "false",
@@ -750,7 +841,38 @@ static void SaveWindowState(HWND hwnd)
         g_procAbsMode[0] ? 1 : 0,
         g_procAbsMode[1] ? 1 : 0,
         g_procAbsMode[2] ? 1 : 0,
-        g_procAbsMode[3] ? 1 : 0);
+        g_procAbsMode[3] ? 1 : 0,
+        g_colCount);
+    // Column panel definitions
+    for (int c = 0; c < g_colCount; c++)
+    {
+        fprintf(f, "    \"col_%d\": \"", c + 1);
+        for (int r = 0; r < g_colPanelCount[c]; r++)
+        {
+            if (r > 0) fputc('|', f);
+            fputs(g_colPanels[c][r], f);
+        }
+        fputs("\",\n", f);
+    }
+    // Vertical (column) dividers
+    for (int k = 0; k < g_colCount - 1; k++)
+        fprintf(f, "    \"col_div_%d\": %.2f,\n", k + 1, (double)g_colDivX[k]);
+    // Horizontal (row) dividers — last value gets no trailing comma (valid JSON)
+    {
+        // Collect all row-divider entries so we know which is last
+        struct { int c, r; } entries[MAX_COLS * MAX_PANELS_PER_COL];
+        int ne = 0;
+        for (int c = 0; c < g_colCount; c++)
+            for (int r = 0; r < g_colPanelCount[c] - 1; r++)
+                entries[ne++] = {c, r};
+        for (int i = 0; i < ne; i++)
+        {
+            int c = entries[i].c, r = entries[i].r;
+            const char* comma = (i < ne - 1) ? "," : "";
+            fprintf(f, "    \"col_%d_ydiv_%d\": %.2f%s\n", c + 1, r + 1, (double)g_colDivY[c][r], comma);
+        }
+    }
+    fputs("}\n", f);
     fclose(f);
 }
 
@@ -860,16 +982,6 @@ static void LoadConfig()
     if (JsonInt(buf, "win_w",        &iv) && iv > 0) g_cfgWinW = iv;
     if (JsonInt(buf, "win_h",        &iv) && iv > 0) g_cfgWinH = iv;
 
-    double dv = 0.0;
-    if (JsonDouble(buf, "divider_x", &dv) && dv > 0.0)
-        g_cfgDividerX = (float)dv;
-    if (JsonDouble(buf, "divider_y", &dv) && dv > 0.0)
-        g_cfgDividerY = (float)dv;
-    if (JsonDouble(buf, "divider_x2", &dv) && dv > 0.0)
-        g_cfgDividerX2 = (float)dv;
-    if (JsonDouble(buf, "divider_y2", &dv) && dv > 0.0)
-        g_cfgDividerY2 = (float)dv;
-
     int habrMin = 0;
     if (JsonInt(buf, "habr_refresh_minutes", &habrMin) && habrMin > 0)
         g_habrRefreshMin = habrMin;
@@ -953,6 +1065,42 @@ static void LoadConfig()
         PAD         = 6.f  * g_fontScale;
         VEDGE       = 14.f * g_fontScale;
         g_fontSize  = 14.f * g_fontScale;
+    }
+
+    // Column layout
+    SetDefaultLayout();
+    {
+        int colCount = 0;
+        if (JsonInt(buf, "col_count", &colCount) && colCount >= 1 && colCount <= MAX_COLS)
+        {
+            g_colCount = colCount;
+            for (int c = 0; c < g_colCount; c++)
+            {
+                char key[32], val[256] = {};
+                snprintf(key, sizeof(key), "col_%d", c + 1);
+                if (JsonStr(buf, key, 0, val, sizeof(val)) && val[0])
+                    g_colPanelCount[c] = ParsePanelList(val, g_colPanels[c], MAX_PANELS_PER_COL);
+            }
+        }
+        // Vertical dividers
+        for (int k = 0; k < g_colCount - 1; k++)
+        {
+            char key[32]; double dv = 0.0;
+            snprintf(key, sizeof(key), "col_div_%d", k + 1);
+            if (JsonDouble(buf, key, &dv) && dv > 0.0)
+            { g_colDivX[k] = (float)dv; g_colDivXSet[k] = true; }
+        }
+        // Horizontal (row) dividers
+        for (int c = 0; c < g_colCount; c++)
+        {
+            for (int r = 0; r < g_colPanelCount[c] - 1; r++)
+            {
+                char key[32]; double dv = 0.0;
+                snprintf(key, sizeof(key), "col_%d_ydiv_%d", c + 1, r + 1);
+                if (JsonDouble(buf, key, &dv) && dv > 0.0)
+                { g_colDivY[c][r] = (float)dv; g_colDivYSet[c][r] = true; }
+            }
+        }
     }
 
     ApplyAutostart();
@@ -2822,6 +2970,158 @@ static void SampleProcesses()
 }
 
 // -----------------------------------------------------------------------
+// Panel drawing helpers
+// -----------------------------------------------------------------------
+static void DrawChartPanel(ID2D1RenderTarget* rt, int dataIdx, D2D1_RECT_F area)
+{
+    const float x      = area.left;
+    const float y      = area.top;
+    const float colW   = area.right - area.left;
+    const float rowH   = area.bottom - area.top;
+    const float titleH = g_fontSize * 1.4f;
+    const float margin = 8.f;
+
+    // Store rect for click detection
+    switch (dataIdx) {
+        case 0: g_cpuChartRect  = area; break;
+        case 1: g_gpuChartRect  = area; break;
+        case 2: g_ramChartRect  = area; break;
+        case 3: g_diskChartRect = area; break;
+    }
+
+    auto drawTitle = [&](const wchar_t* name) {
+        ID2D1SolidColorBrush* pB = nullptr;
+        if (SUCCEEDED(rt->CreateSolidColorBrush(D2D1::ColorF(0.f,0.f,0.f,1.f), &pB))) {
+            DrawTextEllipsis(rt, name, (UINT32)wcslen(name), g_pChartFmtL,
+                             {x+margin, y, x+colW-margin, y+titleH}, pB);
+            pB->Release();
+        }
+    };
+
+    if (dataIdx == 0) // CPU
+    {
+        if (g_cpuMode == 0) {
+            DrawChart(rt, g_charts[0], area, g_pChartFmtL, g_pChartFmtR);
+        } else if (g_cpuMode == 3) {
+            drawTitle(g_charts[0].name);
+            float halfW = colW/2.f, cY = y+titleH;
+            int ms = max(2, CHART_SAMPLES/2);
+            DrawChart(rt, g_charts[0],    {x,       cY, x+halfW, y+rowH}, nullptr, g_pChartFmtR, ms);
+            DrawChart(rt, g_cpuTempChart, {x+halfW, cY, x+colW,  y+rowH}, nullptr, g_pChartFmtR, ms, true);
+        } else {
+            drawTitle(g_charts[0].name);
+            const Chart* cores = (g_cpuMode==1) ? g_logicalCharts  : g_physicalCharts;
+            int nc = (g_cpuMode==1) ? g_logicalCoreCount : g_physicalCoreCount;
+            if (nc < 1) nc = 1;
+            int ms = max(2, CHART_SAMPLES/nc);
+            float mW = colW/(float)nc, cY = y+titleH;
+            for (int c = 0; c < nc; c++)
+                DrawChart(rt, cores[c], {x+c*mW, cY, x+(c+1)*mW, y+rowH}, g_pChartFmtL, g_pChartFmtR, ms);
+        }
+    }
+    else if (dataIdx == 1) // GPU
+    {
+        if (g_gpuMode == 0)
+            DrawChart(rt, g_charts[1], area, g_pChartFmtL, g_pChartFmtR);
+        else if (g_gpuMode == 1)
+            DrawChart(rt, g_gpuVramChart, area, g_pChartFmtL, g_pChartFmtR);
+        else if (g_gpuMode == 2)
+            DrawChart(rt, g_gpuTempChart, area, g_pChartFmtL, g_pChartFmtR);
+        else if (g_gpuMode == 3) {
+            drawTitle(g_charts[1].name);
+            float halfW = colW/2.f, cY = y+titleH; int ms = max(2, CHART_SAMPLES/2);
+            DrawChart(rt, g_charts[1],    {x,       cY, x+halfW, y+rowH}, nullptr, g_pChartFmtR, ms);
+            DrawChart(rt, g_gpuVramChart, {x+halfW, cY, x+colW,  y+rowH}, nullptr, g_pChartFmtR, ms);
+        } else { // gpuMode == 4
+            drawTitle(g_charts[1].name);
+            float tW = colW/3.f, cY = y+titleH; int ms = max(2, CHART_SAMPLES/3);
+            Chart core = g_charts[1]; core.displayAbsStr[0] = L'\0';
+            DrawChart(rt, core,           {x,        cY, x+tW,      y+rowH}, nullptr, g_pChartFmtR, ms);
+            DrawChart(rt, g_gpuVramChart, {x+tW,     cY, x+2.f*tW,  y+rowH}, nullptr, g_pChartFmtR, ms);
+            DrawChart(rt, g_gpuTempChart, {x+2.f*tW, cY, x+colW,    y+rowH}, nullptr, g_pChartFmtR, ms, true);
+        }
+    }
+    else if (dataIdx == 2) // RAM
+    {
+        if (g_ramMode == 0)
+            DrawChart(rt, g_charts[2], area, g_pChartFmtL, g_pChartFmtR);
+        else {
+            drawTitle(g_charts[2].name);
+            float halfW = colW/2.f, cY = y+titleH; int ms = max(2, CHART_SAMPLES/2);
+            DrawChart(rt, g_charts[2],    {x,       cY, x+halfW, y+rowH}, nullptr, g_pChartFmtR, ms);
+            DrawChart(rt, g_ramTempChart, {x+halfW, cY, x+colW,  y+rowH}, nullptr, g_pChartFmtR, ms, true);
+        }
+    }
+    else if (dataIdx == 3) // Disk
+    {
+        int di = g_diskMode - 1;
+        bool validDisk = (g_diskMode > 0) && (di < g_diskCount);
+        const Chart& base  = validDisk ? g_diskCharts[di]     : g_charts[3];
+        const Chart& rdC   = validDisk ? g_diskReadCharts[di]  : g_diskTotalReadChart;
+        const Chart& wrC   = validDisk ? g_diskWriteCharts[di] : g_diskTotalWriteChart;
+        const Chart* tmpC  = validDisk ? &g_diskTempCharts[di] : nullptr;
+        if (g_diskSubMode == 1) {
+            drawTitle(base.name);
+            float halfW = colW/2.f, cY = y+titleH; int ms = max(2, CHART_SAMPLES/2);
+            DrawChart(rt, rdC, {x,       cY, x+halfW, y+rowH}, nullptr, g_pChartFmtR, ms, true);
+            DrawChart(rt, wrC, {x+halfW, cY, x+colW,  y+rowH}, nullptr, g_pChartFmtR, ms, true);
+        } else if (g_diskSubMode == 2 && tmpC) {
+            drawTitle(base.name);
+            float tW = colW/3.f, cY = y+titleH; int ms = max(2, CHART_SAMPLES/3);
+            DrawChart(rt, rdC,   {x,        cY, x+tW,     y+rowH}, nullptr, g_pChartFmtR, ms, true);
+            DrawChart(rt, wrC,   {x+tW,     cY, x+2.f*tW, y+rowH}, nullptr, g_pChartFmtR, ms, true);
+            DrawChart(rt, *tmpC, {x+2.f*tW, cY, x+colW,   y+rowH}, nullptr, g_pChartFmtR, ms, true);
+        } else if (g_diskMode > 0)
+            DrawChart(rt, base, area, g_pChartFmtL, g_pChartFmtR);
+        else
+            DrawChart(rt, g_charts[3], area, g_pChartFmtL, g_pChartFmtR);
+    }
+}
+
+static void DrawProcPanel(ID2D1RenderTarget* rt, int dataIdx, D2D1_RECT_F area)
+{
+    if (dataIdx < 0 || dataIdx > 3) return;
+    static const wchar_t* titles[4] = { L"CPU", L"GPU", L"RAM", L"Disk" };
+    const ProcEntry* data[4] = { g_dispProcCpu, g_dispProcGpu, g_dispProcRam, g_dispProcDisk };
+    int cnts[4] = { g_dispProcCpuCount, g_dispProcGpuCount, g_dispProcRamCount, g_dispProcDiskCount };
+
+    g_procListRects[dataIdx] = area;
+
+    const float lineH = g_fontSize * 1.4f;
+    int maxE = (int)((area.bottom - area.top - lineH - 2.f) / lineH);
+    if (maxE < 0) maxE = 0;
+    DrawProcessList(rt, titles[dataIdx], data[dataIdx], cnts[dataIdx], area, g_procAbsMode[dataIdx], maxE);
+}
+
+static void DispatchPanel(ID2D1RenderTarget* rt, const char* type, D2D1_RECT_F area)
+{
+    if (!type || !type[0] || strcmp(type, "none") == 0) return;
+    if (strcmp(type, "weather") == 0)
+    {
+        WeatherData wd;
+        EnterCriticalSection(&g_weatherCS);
+        wd = g_weather;
+        LeaveCriticalSection(&g_weatherCS);
+        DrawWeather(rt, wd, area);
+    }
+    else if (strcmp(type, "ip") == 0)
+        DrawIpPanel(rt, area);
+    else if (strcmp(type, "rss") == 0)
+    {
+        if (g_rssPanelRectCount < MAX_COLS * MAX_PANELS_PER_COL)
+            g_rssPanelRects[g_rssPanelRectCount++] = area;
+        DrawHabrPanel(rt, area, g_habrHover);
+    }
+    else
+    {
+        int ci = ChartPanelIdx(type);
+        if (ci >= 0) { DrawChartPanel(rt, ci, area); return; }
+        int pi = ProcPanelIdx(type);
+        if (pi >= 0) DrawProcPanel(rt, pi, area);
+    }
+}
+
+// -----------------------------------------------------------------------
 // Layered window update
 // -----------------------------------------------------------------------
 static void UpdateLayeredContent(HWND hwnd)
@@ -2854,258 +3154,58 @@ static void UpdateLayeredContent(HWND hwnd)
         g_pDCRT->BeginDraw();
         g_pDCRT->Clear(D2D1::ColorF(0.f, 0.f, 0.f, 1.f / 255.f));
 
-        // --- Weather panel (top-left: above horizontal divider) ---
-        if (g_dividerX > 2.f * PAD && g_dividerY > VEDGE + PAD)
-        {
-            WeatherData wd;
-            EnterCriticalSection(&g_weatherCS);
-            wd = g_weather;
-            LeaveCriticalSection(&g_weatherCS);
-            D2D1_RECT_F weatherArea = { PAD, VEDGE, g_dividerX - PAD, g_dividerY - PAD };
-            DrawWeather(g_pDCRT, wd, weatherArea);
-        }
+        // Reset per-frame click-detection rects
+        g_cpuChartRect  = {};
+        g_gpuChartRect  = {};
+        g_ramChartRect  = {};
+        g_diskChartRect = {};
+        for (int i = 0; i < NUM_CHARTS; ++i) g_procListRects[i] = {};
+        g_rssPanelRectCount = 0;
 
-        // --- Horizontal divider 1 (weather / IP) ---
+        // Reusable brush helper
+        auto MakeBrush = [&]() -> ID2D1SolidColorBrush* {
+            ID2D1SolidColorBrush* b = nullptr;
+            g_pDCRT->CreateSolidColorBrush(D2D1::ColorF(0.f,0.f,0.f,1.f), &b);
+            return b;
+        };
+
+        // Draw all columns
+        for (int c = 0; c < g_colCount; c++)
         {
-            ID2D1SolidColorBrush* pDivH = nullptr;
-            if (SUCCEEDED(g_pDCRT->CreateSolidColorBrush(D2D1::ColorF(0.f, 0.f, 0.f, 1.f), &pDivH)))
+            float colL = (c == 0) ? PAD : g_colDivX[c - 1] + PAD;
+            float colR = (c < g_colCount - 1) ? g_colDivX[c] - PAD : (float)w - PAD;
+            if (colR <= colL) continue;
+
+            int n = g_colPanelCount[c];
+            if (n <= 0) continue;
+
+            for (int r = 0; r < n; r++)
             {
-                g_pDCRT->DrawLine(
-                    D2D1::Point2F(PAD, g_dividerY),
-                    D2D1::Point2F(g_dividerX - PAD, g_dividerY),
-                    pDivH, 0.75f);
-                pDivH->Release();
-            }
-        }
+                float rowT = (r == 0) ? VEDGE : g_colDivY[c][r - 1] + PAD;
+                float rowB = (r == n - 1) ? (float)h - VEDGE : g_colDivY[c][r] - PAD;
+                if (rowB <= rowT) continue;
 
-        // --- IP panel (between dividerY and dividerY2) ---
-        if (g_dividerX > 2.f * PAD && g_dividerY + PAD < g_dividerY2 - PAD)
-        {
-            D2D1_RECT_F ipArea = { PAD, g_dividerY + PAD, g_dividerX - PAD, g_dividerY2 - PAD };
-            DrawIpPanel(g_pDCRT, ipArea);
-        }
+                DispatchPanel(g_pDCRT, g_colPanels[c][r], {colL, rowT, colR, rowB});
 
-        // --- Horizontal divider 2 (IP / Habr) ---
-        {
-            ID2D1SolidColorBrush* pDivH2 = nullptr;
-            if (SUCCEEDED(g_pDCRT->CreateSolidColorBrush(D2D1::ColorF(0.f, 0.f, 0.f, 1.f), &pDivH2)))
-            {
-                g_pDCRT->DrawLine(
-                    D2D1::Point2F(PAD, g_dividerY2),
-                    D2D1::Point2F(g_dividerX - PAD, g_dividerY2),
-                    pDivH2, 0.75f);
-                pDivH2->Release();
-            }
-        }
-
-        // --- Habr panel (bottom-left: below horizontal divider 2) ---
-        if (g_dividerX > 2.f * PAD && g_dividerY2 + PAD < (float)h - VEDGE)
-        {
-            D2D1_RECT_F habrArea = { PAD, g_dividerY2 + PAD,
-                                     g_dividerX - PAD, (float)h - VEDGE };
-            DrawHabrPanel(g_pDCRT, habrArea, g_habrHover);
-        }
-
-        // --- Vertical divider line (left panel | charts) ---
-        {
-            ID2D1SolidColorBrush* pDiv = nullptr;
-            if (SUCCEEDED(g_pDCRT->CreateSolidColorBrush(D2D1::ColorF(0.f, 0.f, 0.f, 1.f), &pDiv)))
-            {
-                g_pDCRT->DrawLine(
-                    D2D1::Point2F(g_dividerX, VEDGE),
-                    D2D1::Point2F(g_dividerX, (float)h - VEDGE),
-                    pDiv, 0.75f);
-                pDiv->Release();
-            }
-        }
-
-        // --- Vertical divider line (charts | process lists) ---
-        {
-            ID2D1SolidColorBrush* pDiv2 = nullptr;
-            if (SUCCEEDED(g_pDCRT->CreateSolidColorBrush(D2D1::ColorF(0.f, 0.f, 0.f, 1.f), &pDiv2)))
-            {
-                g_pDCRT->DrawLine(
-                    D2D1::Point2F(g_dividerX2, VEDGE),
-                    D2D1::Point2F(g_dividerX2, (float)h - VEDGE),
-                    pDiv2, 0.75f);
-                pDiv2->Release();
-            }
-        }
-
-        // --- Charts (between the two right-side dividers) ---
-        {
-            const float chartLeft = g_dividerX + PAD;
-            const float colW = g_dividerX2 - PAD - chartLeft;
-            const float rowH = ((float)h - 2.f * VEDGE - (NUM_CHARTS - 1) * PAD) / NUM_CHARTS;
-
-            // Store chart rects for click detection (chart portion only)
-            g_cpuChartRect  = { chartLeft, VEDGE,                       chartLeft + colW, VEDGE + rowH };
-            g_gpuChartRect  = { chartLeft, VEDGE + (rowH + PAD),        chartLeft + colW, VEDGE + (rowH + PAD) + rowH };
-            g_ramChartRect  = { chartLeft, VEDGE + 2.f * (rowH + PAD),  chartLeft + colW, VEDGE + 2.f * (rowH + PAD) + rowH };
-            g_diskChartRect = { chartLeft, VEDGE + 3.f * (rowH + PAD),  chartLeft + colW, VEDGE + 3.f * (rowH + PAD) + rowH };
-
-            const float titleH = g_fontSize * 1.4f;
-            const float margin = 8.f;
-
-            for (int i = 0; i < NUM_CHARTS; ++i)
-            {
-                float x = chartLeft;
-                float y = VEDGE + i * (rowH + PAD);
-                D2D1_RECT_F area = { x, y, x + colW, y + rowH };
-
-                auto drawChartTitle = [&](const wchar_t* name) {
-                    ID2D1SolidColorBrush* pB = nullptr;
-                    if (SUCCEEDED(g_pDCRT->CreateSolidColorBrush(D2D1::ColorF(0.f, 0.f, 0.f, 1.f), &pB))) {
-                        DrawTextEllipsis(g_pDCRT, name, (UINT32)wcslen(name), g_pChartFmtL,
-                                         { x + margin, y, x + colW - margin, y + titleH }, pB);
-                        pB->Release();
-                    }
-                };
-
-                if (i == 0 && g_cpuMode != 0)
+                // Horizontal row divider below this panel
+                if (r < n - 1)
                 {
-                    if (g_cpuMode == 3)
+                    if (ID2D1SolidColorBrush* pD = MakeBrush())
                     {
-                        // Load + Temp side by side
-                        drawChartTitle(g_charts[0].name);
-                        float halfW  = colW / 2.f;
-                        float chartY = y + titleH;
-                        int miniSamples = max(2, CHART_SAMPLES / 2);
-                        DrawChart(g_pDCRT, g_charts[0],    { x,         chartY, x + halfW, y + rowH }, nullptr, g_pChartFmtR, miniSamples);
-                        DrawChart(g_pDCRT, g_cpuTempChart, { x + halfW, chartY, x + colW,  y + rowH }, nullptr, g_pChartFmtR, miniSamples, true);
-                    }
-                    else
-                    {
-                        drawChartTitle(g_charts[0].name);
-                        const Chart* cores = (g_cpuMode == 1) ? g_logicalCharts  : g_physicalCharts;
-                        int coreCount      = (g_cpuMode == 1) ? g_logicalCoreCount : g_physicalCoreCount;
-                        if (coreCount < 1) coreCount = 1;
-                        int miniSamples = max(2, CHART_SAMPLES / coreCount);
-                        float miniW  = colW / (float)coreCount;
-                        float chartY = y + titleH;
-                        for (int c = 0; c < coreCount; c++)
-                        {
-                            D2D1_RECT_F mini = { x + c * miniW, chartY, x + (c + 1) * miniW, y + rowH };
-                            DrawChart(g_pDCRT, cores[c], mini, g_pChartFmtL, g_pChartFmtR, miniSamples);
-                        }
+                        g_pDCRT->DrawLine({colL, g_colDivY[c][r]}, {colR, g_colDivY[c][r]}, pD, 0.75f);
+                        pD->Release();
                     }
                 }
-                else if (i == 1 && g_gpuMode != 0)
-                {
-                    if (g_gpuMode == 1)
-                        DrawChart(g_pDCRT, g_gpuVramChart, area, g_pChartFmtL, g_pChartFmtR);
-                    else if (g_gpuMode == 2)
-                        DrawChart(g_pDCRT, g_gpuTempChart, area, g_pChartFmtL, g_pChartFmtR);
-                    else if (g_gpuMode == 3)
-                    {
-                        drawChartTitle(g_charts[1].name);
-                        float halfW  = colW / 2.f;
-                        float chartY = y + titleH;
-                        int miniSamples = max(2, CHART_SAMPLES / 2);
-                        DrawChart(g_pDCRT, g_charts[1],    { x,         chartY, x + halfW, y + rowH }, nullptr, g_pChartFmtR, miniSamples);
-                        DrawChart(g_pDCRT, g_gpuVramChart, { x + halfW, chartY, x + colW,  y + rowH }, nullptr, g_pChartFmtR, miniSamples);
-                    }
-                    else // g_gpuMode == 4: core + VRAM + temp
-                    {
-                        drawChartTitle(g_charts[1].name);
-                        float thirdW = colW / 3.f;
-                        float chartY = y + titleH;
-                        int miniSamples = max(2, CHART_SAMPLES / 3);
-                        Chart coreOnly = g_charts[1];
-                        coreOnly.displayAbsStr[0] = L'\0';
-                        DrawChart(g_pDCRT, coreOnly,       { x,               chartY, x + thirdW,     y + rowH }, nullptr, g_pChartFmtR, miniSamples);
-                        DrawChart(g_pDCRT, g_gpuVramChart, { x + thirdW,      chartY, x + 2.f*thirdW, y + rowH }, nullptr, g_pChartFmtR, miniSamples);
-                        DrawChart(g_pDCRT, g_gpuTempChart, { x + 2.f*thirdW,  chartY, x + colW,       y + rowH }, nullptr, g_pChartFmtR, miniSamples, true);
-                    }
-                }
-                else if (i == 2 && g_ramMode == 1)
-                {
-                    // Load (left) + Temp (right) side by side
-                    drawChartTitle(g_charts[2].name);
-                    float halfW  = colW / 2.f;
-                    float chartY = y + titleH;
-                    int miniSamples = max(2, CHART_SAMPLES / 2);
-                    DrawChart(g_pDCRT, g_charts[2],    { x,         chartY, x + halfW, y + rowH }, nullptr, g_pChartFmtR, miniSamples);
-                    DrawChart(g_pDCRT, g_ramTempChart, { x + halfW, chartY, x + colW,  y + rowH }, nullptr, g_pChartFmtR, miniSamples, true);
-                }
-                else if (i == 3 && (g_diskMode > 0 || g_diskSubMode > 0))
-                {
-                    int di = g_diskMode - 1; // -1 for _Total
-                    bool isTotal = (g_diskMode == 0);
-                    bool validDisk = !isTotal && di < g_diskCount;
-
-                    const Chart& baseChart = (validDisk ? g_diskCharts[di] : g_charts[3]);
-                    const Chart& readChart  = (validDisk ? g_diskReadCharts[di]  : g_diskTotalReadChart);
-                    const Chart& writeChart = (validDisk ? g_diskWriteCharts[di] : g_diskTotalWriteChart);
-                    const Chart* tempChart  = (validDisk ? &g_diskTempCharts[di] : nullptr);
-
-                    if (g_diskSubMode == 1)
-                    {
-                        // Read (left) + Write (right) side by side
-                        drawChartTitle(baseChart.name);
-                        float halfW  = colW / 2.f;
-                        float chartY = y + titleH;
-                        int miniSamples = max(2, CHART_SAMPLES / 2);
-                        DrawChart(g_pDCRT, readChart,  { x,         chartY, x + halfW, y + rowH }, nullptr, g_pChartFmtR, miniSamples, true);
-                        DrawChart(g_pDCRT, writeChart, { x + halfW, chartY, x + colW,  y + rowH }, nullptr, g_pChartFmtR, miniSamples, true);
-                    }
-                    else if (g_diskSubMode == 2 && tempChart)
-                    {
-                        // Read + Write + Temp, three panels
-                        drawChartTitle(baseChart.name);
-                        float thirdW = colW / 3.f;
-                        float chartY = y + titleH;
-                        int miniSamples = max(2, CHART_SAMPLES / 3);
-                        DrawChart(g_pDCRT, readChart,   { x,              chartY, x + thirdW,     y + rowH }, nullptr, g_pChartFmtR, miniSamples, true);
-                        DrawChart(g_pDCRT, writeChart,  { x + thirdW,     chartY, x + 2.f*thirdW, y + rowH }, nullptr, g_pChartFmtR, miniSamples, true);
-                        DrawChart(g_pDCRT, *tempChart,  { x + 2.f*thirdW, chartY, x + colW,       y + rowH }, nullptr, g_pChartFmtR, miniSamples, true);
-                    }
-                    else if (g_diskMode > 0)
-                    {
-                        DrawChart(g_pDCRT, baseChart, area, g_pChartFmtL, g_pChartFmtR);
-                    }
-                    else
-                    {
-                        DrawChart(g_pDCRT, g_charts[3], area, g_pChartFmtL, g_pChartFmtR);
-                    }
-                }
-                else
-                {
-                    DrawChart(g_pDCRT, g_charts[i], area, g_pChartFmtL, g_pChartFmtR);
-                }
             }
-        }
 
-        // --- Process lists (right of second divider) ---
-        {
-            static const wchar_t* procTitles[NUM_CHARTS] = { L"CPU", L"GPU", L"RAM", L"Disk" };
-            const ProcEntry* dataArr[NUM_CHARTS] = {
-                g_dispProcCpu, g_dispProcGpu, g_dispProcRam, g_dispProcDisk
-            };
-            int dataCnt[NUM_CHARTS] = {
-                g_dispProcCpuCount, g_dispProcGpuCount, g_dispProcRamCount, g_dispProcDiskCount
-            };
-
-            const float listLeft = g_dividerX2 + PAD;
-            const float listW    = (float)w - listLeft - PAD;
-            const float rowH     = ((float)h - 2.f * VEDGE - (NUM_CHARTS - 1) * PAD) / NUM_CHARTS;
-            const float lineH    = g_fontSize * 1.4f;
-
-            for (int i = 0; i < NUM_CHARTS; ++i)
+            // Vertical divider after this column
+            if (c < g_colCount - 1)
             {
-                float y = VEDGE + i * (rowH + PAD);
-                D2D1_RECT_F listArea = { listLeft, y, listLeft + listW, y + rowH };
-                g_procListRects[i]   = listArea;
-
-                // Compute how many entries fit: subtract title line + separator (lineH + 2px)
-                int maxEntries = (int)((rowH - lineH - 2.f) / lineH);
-                if (maxEntries < 0) maxEntries = 0;
-
-                DrawProcessList(g_pDCRT, procTitles[i],
-                                dataArr[i], dataCnt[i],
-                                listArea,
-                                g_procAbsMode[i],
-                                maxEntries);
+                if (ID2D1SolidColorBrush* pD = MakeBrush())
+                {
+                    g_pDCRT->DrawLine({g_colDivX[c], VEDGE}, {g_colDivX[c], (float)h - VEDGE}, pD, 0.75f);
+                    pD->Release();
+                }
             }
         }
 
@@ -3325,30 +3425,10 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
         SampleMetrics();
         FlushDisplayValues();
 
-        // Restore dividers from config or set defaults
+        // Initialize dividers from config or compute defaults
         {
             RECT rc; GetWindowRect(hwnd, &rc);
-            int w = rc.right - rc.left;
-            int h = rc.bottom - rc.top;
-            if (g_cfgDividerX > 0.f)
-                g_dividerX = max(80.f, min(g_cfgDividerX, (float)w - 80.f));
-            else
-                g_dividerX = (float)w * 0.28f;
-
-            if (g_cfgDividerY > 0.f)
-                g_dividerY = max(60.f, min(g_cfgDividerY, (float)h - 60.f));
-            else
-                g_dividerY = (float)h * 0.55f;
-
-            if (g_cfgDividerX2 > 0.f)
-                g_dividerX2 = max(g_dividerX + 120.f, min(g_cfgDividerX2, (float)w - 80.f));
-            else
-                g_dividerX2 = g_dividerX + ((float)w - g_dividerX) * 0.60f;
-
-            if (g_cfgDividerY2 > 0.f)
-                g_dividerY2 = max(g_dividerY + 30.f, min(g_cfgDividerY2, (float)h - 60.f));
-            else
-                g_dividerY2 = g_dividerY + ((float)h - g_dividerY) * 0.20f;
+            InitDividers(rc.right - rc.left, rc.bottom - rc.top);
         }
 
         // Config already loaded in WinMain; kick weather, Habr, CPU temp, and IP fetches
@@ -3461,55 +3541,42 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
         int mx = pt.x - rc.left;
         int my = pt.y - rc.top;
         int wh = rc.bottom - rc.top;
+        int ww = rc.right - rc.left;
 
-        // Vertical divider 1 hit → client (so WM_LBUTTONDOWN fires)
-        if (abs(mx - (int)g_dividerX) <= DIV_HIT &&
-            my >= (int)VEDGE && my <= wh - (int)VEDGE)
-            return HTCLIENT;
+        // Vertical column dividers
+        for (int k = 0; k < g_colCount - 1; k++)
+            if (abs(mx - (int)g_colDivX[k]) <= DIV_HIT && my >= (int)VEDGE && my <= wh - (int)VEDGE)
+                return HTCLIENT;
 
-        // Vertical divider 2 hit (charts | process lists)
-        if (abs(mx - (int)g_dividerX2) <= DIV_HIT &&
-            my >= (int)VEDGE && my <= wh - (int)VEDGE)
-            return HTCLIENT;
+        // Horizontal row dividers within each column
+        for (int c = 0; c < g_colCount; c++)
+        {
+            float colL = (c == 0) ? PAD : g_colDivX[c - 1] + PAD;
+            float colR = (c < g_colCount - 1) ? g_colDivX[c] - PAD : (float)ww - PAD;
+            if ((float)mx >= colL && (float)mx <= colR)
+                for (int r = 0; r < g_colPanelCount[c] - 1; r++)
+                    if (abs(my - (int)g_colDivY[c][r]) <= DIV_HIT)
+                        return HTCLIENT;
+        }
 
-        // Horizontal divider hit (within left panel)
-        if (mx >= 0 && mx < (int)g_dividerX - DIV_HIT &&
-            abs(my - (int)g_dividerY) <= DIV_HIT)
-            return HTCLIENT;
+        // RSS panels need HTCLIENT for link hover/click
+        for (int i = 0; i < g_rssPanelRectCount; i++)
+            if ((float)mx >= g_rssPanelRects[i].left  && (float)mx <= g_rssPanelRects[i].right &&
+                (float)my >= g_rssPanelRects[i].top   && (float)my <= g_rssPanelRects[i].bottom)
+                return HTCLIENT;
 
-        // Horizontal divider 2 (IP / Habr)
-        if (mx >= 0 && mx < (int)g_dividerX - DIV_HIT &&
-            abs(my - (int)g_dividerY2) <= DIV_HIT)
-            return HTCLIENT;
-
-        // Habr panel (below horizontal divider 2, left of vertical divider)
-        if (mx >= 0 && mx < (int)g_dividerX - DIV_HIT &&
-            my > (int)g_dividerY2 + DIV_HIT && my < wh - (int)VEDGE)
-            return HTCLIENT;
-
-        // CPU chart row → client so click fires
-        if ((float)mx >= g_cpuChartRect.left && (float)mx <= g_cpuChartRect.right &&
-            (float)my >= g_cpuChartRect.top  && (float)my <= g_cpuChartRect.bottom)
-            return HTCLIENT;
-
-        // GPU chart row
-        if ((float)mx >= g_gpuChartRect.left && (float)mx <= g_gpuChartRect.right &&
-            (float)my >= g_gpuChartRect.top  && (float)my <= g_gpuChartRect.bottom)
-            return HTCLIENT;
-
-        // RAM chart row
-        if ((float)mx >= g_ramChartRect.left && (float)mx <= g_ramChartRect.right &&
-            (float)my >= g_ramChartRect.top  && (float)my <= g_ramChartRect.bottom)
-            return HTCLIENT;
-
-        // Disk chart row
-        if ((float)mx >= g_diskChartRect.left && (float)mx <= g_diskChartRect.right &&
-            (float)my >= g_diskChartRect.top  && (float)my <= g_diskChartRect.bottom)
-            return HTCLIENT;
+        // Chart click areas
+        D2D1_RECT_F* chartRects[4] = { &g_cpuChartRect, &g_gpuChartRect, &g_ramChartRect, &g_diskChartRect };
+        for (int i = 0; i < 4; i++)
+            if (chartRects[i]->right > chartRects[i]->left &&
+                (float)mx >= chartRects[i]->left && (float)mx <= chartRects[i]->right &&
+                (float)my >= chartRects[i]->top  && (float)my <= chartRects[i]->bottom)
+                return HTCLIENT;
 
         // Process list areas
         for (int i = 0; i < NUM_CHARTS; ++i)
-            if ((float)mx >= g_procListRects[i].left  && (float)mx <= g_procListRects[i].right &&
+            if (g_procListRects[i].right > g_procListRects[i].left &&
+                (float)mx >= g_procListRects[i].left  && (float)mx <= g_procListRects[i].right &&
                 (float)my >= g_procListRects[i].top   && (float)my <= g_procListRects[i].bottom)
                 return HTCLIENT;
 
@@ -3527,21 +3594,26 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
             int my = pt.y - rc.top;
             int wh = rc.bottom - rc.top;
 
-            // Vertical dividers
-            if ((abs(mx - (int)g_dividerX) <= DIV_HIT ||
-                 abs(mx - (int)g_dividerX2) <= DIV_HIT) &&
-                my >= (int)VEDGE && my <= wh - (int)VEDGE)
+            int ww2 = rc.right - rc.left;
+            // Vertical column dividers → horizontal resize cursor
+            for (int k = 0; k < g_colCount - 1; k++)
+                if (abs(mx - (int)g_colDivX[k]) <= DIV_HIT && my >= (int)VEDGE && my <= wh - (int)VEDGE)
+                {
+                    SetCursor(LoadCursorW(NULL, IDC_SIZEWE));
+                    return TRUE;
+                }
+            // Horizontal row dividers → vertical resize cursor
+            for (int c = 0; c < g_colCount; c++)
             {
-                SetCursor(LoadCursorW(NULL, IDC_SIZEWE));
-                return TRUE;
-            }
-            // Horizontal dividers
-            if (mx >= 0 && mx < (int)g_dividerX - DIV_HIT &&
-                (abs(my - (int)g_dividerY) <= DIV_HIT ||
-                 abs(my - (int)g_dividerY2) <= DIV_HIT))
-            {
-                SetCursor(LoadCursorW(NULL, IDC_SIZENS));
-                return TRUE;
+                float colL = (c == 0) ? PAD : g_colDivX[c - 1] + PAD;
+                float colR = (c < g_colCount - 1) ? g_colDivX[c] - PAD : (float)ww2 - PAD;
+                if ((float)mx >= colL && (float)mx <= colR)
+                    for (int r = 0; r < g_colPanelCount[c] - 1; r++)
+                        if (abs(my - (int)g_colDivY[c][r]) <= DIV_HIT)
+                        {
+                            SetCursor(LoadCursorW(NULL, IDC_SIZENS));
+                            return TRUE;
+                        }
             }
             // Link hover
             if (g_habrHover >= 0)
@@ -3558,29 +3630,43 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
     {
         int mx = GET_X_LPARAM(lParam);
         int my = GET_Y_LPARAM(lParam);
-        if (abs(mx - (int)g_dividerX) <= DIV_HIT)
         {
-            g_draggingDiv = true;
-            SetCapture(hwnd);
+            bool divHit = false;
+            for (int k = 0; k < g_colCount - 1 && !divHit; k++)
+            {
+                if (abs(mx - (int)g_colDivX[k]) <= DIV_HIT)
+                {
+                    g_draggingColDivIdx = k;
+                    SetCapture(hwnd);
+                    divHit = true;
+                }
+            }
+            if (!divHit)
+            {
+                RECT rc2; GetWindowRect(hwnd, &rc2);
+                int w = rc2.right - rc2.left;
+                for (int c = 0; c < g_colCount && !divHit; c++)
+                {
+                    float colL = (c == 0) ? PAD : g_colDivX[c-1] + PAD;
+                    float colR = (c < g_colCount-1) ? g_colDivX[c] - PAD : (float)w - PAD;
+                    if ((float)mx >= colL && (float)mx <= colR)
+                    {
+                        for (int r = 0; r < g_colPanelCount[c] - 1 && !divHit; r++)
+                        {
+                            if (abs(my - (int)g_colDivY[c][r]) <= DIV_HIT)
+                            {
+                                g_draggingRowDivCol = c;
+                                g_draggingRowDivIdx = r;
+                                SetCapture(hwnd);
+                                divHit = true;
+                            }
+                        }
+                    }
+                }
+            }
+            if (divHit) return 0;
         }
-        else if (abs(mx - (int)g_dividerX2) <= DIV_HIT)
-        {
-            g_draggingDiv2 = true;
-            SetCapture(hwnd);
-        }
-        else if (mx >= 0 && mx < (int)g_dividerX - DIV_HIT &&
-                 abs(my - (int)g_dividerY) <= DIV_HIT)
-        {
-            g_draggingDivH = true;
-            SetCapture(hwnd);
-        }
-        else if (mx >= 0 && mx < (int)g_dividerX - DIV_HIT &&
-                 abs(my - (int)g_dividerY2) <= DIV_HIT)
-        {
-            g_draggingDivH2 = true;
-            SetCapture(hwnd);
-        }
-        else if ((float)mx >= g_cpuChartRect.left && (float)mx <= g_cpuChartRect.right &&
+        if ((float)mx >= g_cpuChartRect.left && (float)mx <= g_cpuChartRect.right &&
                  (float)my >= g_cpuChartRect.top  && (float)my <= g_cpuChartRect.bottom)
         {
             // Cycle CPU mode: 0 (total) → 1 (logical) → 2 (physical, if SMT) → 3 (load+temp) → 0
@@ -3665,27 +3751,22 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
         TrackMouseEvent(&tme);
         RECT rc; GetWindowRect(hwnd, &rc);
 
-        if (g_draggingDiv)
-        {
-            g_dividerX = max(80.f, min((float)mx, g_dividerX2 - 120.f));
-            UpdateLayeredContent(hwnd);
-        }
-        else if (g_draggingDiv2)
+        if (g_draggingColDivIdx >= 0)
         {
             int w = rc.right - rc.left;
-            g_dividerX2 = max(g_dividerX + 120.f, min((float)mx, (float)w - 80.f));
+            int k = g_draggingColDivIdx;
+            float minX = (k == 0) ? 80.f : g_colDivX[k-1] + 80.f;
+            float maxX = (k == g_colCount-2) ? (float)w - 80.f : g_colDivX[k+1] - 80.f;
+            g_colDivX[k] = max(minX, min((float)mx, maxX));
             UpdateLayeredContent(hwnd);
         }
-        else if (g_draggingDivH)
+        else if (g_draggingRowDivCol >= 0)
         {
             int h = rc.bottom - rc.top;
-            g_dividerY = max(60.f, min((float)my, g_dividerY2 - 30.f));
-            UpdateLayeredContent(hwnd);
-        }
-        else if (g_draggingDivH2)
-        {
-            int h = rc.bottom - rc.top;
-            g_dividerY2 = max(g_dividerY + 30.f, min((float)my, (float)h - 60.f));
+            int c = g_draggingRowDivCol, r = g_draggingRowDivIdx;
+            float minY = (r == 0) ? VEDGE + 30.f : g_colDivY[c][r-1] + 30.f;
+            float maxY = (r == g_colPanelCount[c]-2) ? (float)h - VEDGE - 30.f : g_colDivY[c][r+1] - 30.f;
+            g_colDivY[c][r] = max(minY, min((float)my, maxY));
             UpdateLayeredContent(hwnd);
         }
         else
@@ -3747,11 +3828,20 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
 
     case WM_LBUTTONUP:
     {
-        bool wasDragging = g_draggingDiv || g_draggingDiv2 || g_draggingDivH || g_draggingDivH2;
-        if      (g_draggingDiv)   { g_draggingDiv   = false; ReleaseCapture(); SaveWindowState(hwnd); }
-        else if (g_draggingDiv2)  { g_draggingDiv2  = false; ReleaseCapture(); SaveWindowState(hwnd); }
-        else if (g_draggingDivH)  { g_draggingDivH  = false; ReleaseCapture(); SaveWindowState(hwnd); }
-        else if (g_draggingDivH2) { g_draggingDivH2 = false; ReleaseCapture(); SaveWindowState(hwnd); }
+        bool wasDragging = (g_draggingColDivIdx >= 0) || (g_draggingRowDivCol >= 0);
+        if (g_draggingColDivIdx >= 0)
+        {
+            g_draggingColDivIdx = -1;
+            ReleaseCapture();
+            SaveWindowState(hwnd);
+        }
+        else if (g_draggingRowDivCol >= 0)
+        {
+            g_draggingRowDivCol = -1;
+            g_draggingRowDivIdx = -1;
+            ReleaseCapture();
+            SaveWindowState(hwnd);
+        }
 
         // Link click: only if no drag occurred and mouse is on a visible link
         if (!wasDragging && g_habrHover >= 0 && g_habrHover < g_habrVisible)
@@ -3782,10 +3872,23 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
             RECT rc; GetWindowRect(hwnd, &rc);
             int w = rc.right - rc.left;
             int h = rc.bottom - rc.top;
-            g_dividerX  = max(80.f,  min(g_dividerX,  (float)w - 80.f));
-            g_dividerY  = max(60.f,  min(g_dividerY,  (float)h - 60.f));
-            g_dividerY2 = max(g_dividerY + 30.f, min(g_dividerY2, (float)h - 60.f));
-            g_dividerX2 = max(g_dividerX + 120.f, min(g_dividerX2, (float)w - 80.f));
+            for (int k = 0; k < g_colCount - 1; k++)
+            {
+                float minX = (k == 0) ? 80.f : g_colDivX[k-1] + 80.f;
+                float maxX = (k == g_colCount-2) ? (float)w - 80.f : g_colDivX[k+1] - 80.f;
+                if (maxX < minX) maxX = minX;
+                g_colDivX[k] = max(minX, min(g_colDivX[k], maxX));
+            }
+            for (int c = 0; c < g_colCount; c++)
+            {
+                for (int r = 0; r < g_colPanelCount[c] - 1; r++)
+                {
+                    float minY = (r == 0) ? VEDGE + 30.f : g_colDivY[c][r-1] + 30.f;
+                    float maxY = (r == g_colPanelCount[c]-2) ? (float)h - VEDGE - 30.f : g_colDivY[c][r+1] - 30.f;
+                    if (maxY < minY) maxY = minY;
+                    g_colDivY[c][r] = max(minY, min(g_colDivY[c][r], maxY));
+                }
+            }
             UpdateLayeredContent(hwnd);
         }
         return 0;

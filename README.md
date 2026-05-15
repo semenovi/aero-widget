@@ -23,6 +23,7 @@ A lightweight Windows desktop widget with an Acrylic/Aero blur background. Displ
 - **RSS feed** — configurable RSS source (default: Habr), refreshed on a configurable interval; click a headline to open it in the browser
 - **Acrylic / Aero blur** — uses the undocumented `SetWindowCompositionAttribute` API with DWM fallback, so it works across Windows 10 and 11; rounded corners via DWM
 - **Resizable window** — drag any edge or corner to resize, in addition to dragging the internal panel dividers
+- **Configurable column layout** — number of columns and panel assignment per column are fully configurable in `config.json`; vertical and horizontal dividers appear automatically and are draggable
 - **Persistent layout** — window position, size, and divider positions are saved to `config.json` next to the executable
 - **Configurable font scale** — set `font_scale` in `config.json` to scale all text
 - **CPU temperature sources** — automatically tries HWiNFO64 shared memory, then OpenHardwareMonitor WMI, then LibreHardwareMonitor WMI, then MSAcpi thermal zone, then PDH; no manual configuration needed
@@ -49,25 +50,33 @@ On first launch a `config.json` file is created next to the executable. You can 
 
 ```jsonc
 {
-    "location": "",
+    "location": "Moscow",
     "monitor_left": 0,
     "monitor_top": 0,
     "win_x": 100,
     "win_y": 100,
-    "win_w": 800,
-    "win_h": 600,
-    "divider_x": 300.0,
-    "divider_y": 200.0,
-    "divider_x2": 500.0,
+    "win_w": 1113,
+    "win_h": 614,
     "cpu_mode": 0,
     "gpu_mode": 0,
+    "ram_mode": 0,
     "disk_mode": 0,
+    "disk_sub_mode": 0,
     "font_scale": 1.5,
-    "habr_refresh_minutes": 5,
     "rss_feed_url": "https://habr.com/ru/rss/all/all/",
-    "autostart": false
+    "autostart": false,
+    "proc_abs_cpu": 0,
+    "proc_abs_gpu": 0,
+    "proc_abs_ram": 0,
+    "proc_abs_disk": 0,
+    "col_count": 3,
+    "col_1": "weather|ip|rss",
+    "col_2": "cpu_chart|gpu_chart|ram_chart|disk_chart",
+    "col_3": "cpu_proc|gpu_proc|ram_proc|disk_proc"
 }
 ```
+
+### General keys
 
 | Key | Description |
 |-----|-------------|
@@ -75,24 +84,62 @@ On first launch a `config.json` file is created next to the executable. You can 
 | `monitor_left`, `monitor_top` | Monitor origin used to restore position on multi-monitor setups (auto-saved) |
 | `win_x`, `win_y` | Window position relative to the monitor it was last on (auto-saved) |
 | `win_w`, `win_h` | Window size in pixels (auto-saved) |
-| `divider_x`, `divider_x2` | Positions of the two vertical dividers (auto-saved on drag-end) |
-| `divider_y` | Position of the horizontal divider inside the left column (auto-saved on drag-end) |
 | `cpu_mode` | CPU display mode: `0` total, `1` logical cores, `2` physical cores, `3` load+temp (auto-saved) |
-| `gpu_mode` | GPU display mode: `0` core load, `1` VRAM, `2` temperature, `3` core+VRAM (auto-saved) |
-| `disk_mode` | Disk display mode: `0` aggregate, `1`–`N` individual disk index (auto-saved) |
+| `gpu_mode` | GPU display mode: `0` core load, `1` VRAM, `2` temperature, `3` core+VRAM, `4` core+VRAM+temp (auto-saved) |
+| `ram_mode` | RAM display mode: `0` load, `1` load+temp (auto-saved) |
+| `disk_mode` | Disk index: `0` aggregate, `1`–`N` individual disk (auto-saved) |
+| `disk_sub_mode` | Disk sub-mode: `0` single value, `1` read+write, `2` read+write+temp (auto-saved) |
 | `font_scale` | Global text scale factor (default `1.5`) |
-| `habr_refresh_minutes` | RSS feed refresh interval in minutes (default `5`) |
 | `rss_feed_url` | RSS feed URL (default: Habr all articles); change to any valid RSS 2.0 feed |
 | `autostart` | Launch with Windows (auto-saved) |
+| `proc_abs_cpu/gpu/ram/disk` | `1` = show absolute values in process lists, `0` = percent (auto-saved) |
+
+### Layout keys
+
+| Key | Description |
+|-----|-------------|
+| `col_count` | Number of columns (`1`–`8`) |
+| `col_N` | Pipe-separated list of panels for column N (e.g. `"weather\|ip\|rss"`) |
+| `col_div_K` | X position of the vertical divider between column K and K+1 (auto-saved on drag-end) |
+| `col_N_ydiv_R` | Y position of the R-th horizontal divider inside column N (auto-saved on drag-end) |
+
+Vertical dividers (`col_div_K`) and horizontal dividers (`col_N_ydiv_R`) are optional — if omitted, panels are spaced equally and dividers can be dragged to adjust.
+
+#### Available panel types
+
+| Panel | Description |
+|-------|-------------|
+| `weather` | Weather forecast panel |
+| `ip` | External IP address and country |
+| `rss` | RSS feed headlines |
+| `cpu_chart` | CPU usage chart |
+| `gpu_chart` | GPU usage chart |
+| `ram_chart` | RAM usage chart |
+| `disk_chart` | Disk I/O chart |
+| `cpu_proc` | Top CPU processes list |
+| `gpu_proc` | Top GPU processes list |
+| `ram_proc` | Top RAM processes list |
+| `disk_proc` | Top Disk processes list |
+| `none` | Empty spacer |
+
+#### Example: 2-column layout
+
+```jsonc
+{
+    "col_count": 2,
+    "col_1": "weather|ip|rss",
+    "col_2": "cpu_chart|gpu_chart|ram_chart|disk_chart|cpu_proc|gpu_proc|ram_proc|disk_proc"
+}
+```
 
 ## Usage tips
 
-- **Click** a chart row to cycle through its display modes.
+- **Click** a chart to cycle through its display modes.
 - **Click** a process list tile to toggle between percent and absolute value display.
 - **Click** the weather panel to force an immediate weather refresh.
 - **Right-click** a process entry to kill that process.
 - **Right-click** anywhere else on the widget to close it (same as Escape).
-- **Drag** the vertical or horizontal dividers to resize panels.
+- **Drag** vertical or horizontal dividers to resize panels; positions are saved automatically.
 - **Drag** any edge or corner of the window to resize it.
 - **Escape** closes the widget.
 - The widget lives in the **system tray** — right-click the tray icon to toggle autostart or exit.
