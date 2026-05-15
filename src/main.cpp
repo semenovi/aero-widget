@@ -585,6 +585,7 @@ static HANDLE           g_weatherThread = NULL;
 // Public IP
 // -----------------------------------------------------------------------
 static wchar_t          g_ipStr[64]         = L"";
+static wchar_t          g_ipCountry[64]     = L"";
 static CRITICAL_SECTION g_ipCS;
 static HANDLE           g_ipThread          = NULL;
 static HANDLE           g_ipWatchThread     = NULL;
@@ -1511,8 +1512,33 @@ static DWORD WINAPI IpThreadProc(LPVOID lParam)
         if (wip[0]) break;
     }
 
+    wchar_t wcountry[64] = L"";
+    if (wip[0])
+    {
+        // Build URL: https://ipapi.co/{ip}/country_name/
+        wchar_t geoUrl[128];
+        swprintf_s(geoUrl, L"https://ipapi.co/%s/country_name/", wip);
+        char* gbody = HttpGetUrl(geoUrl, L"AeroWidget/1.0");
+        if (gbody)
+        {
+            TrimRight(gbody);
+            // Validate: plain text country name, no HTML tags, reasonable length
+            int glen = (int)strlen(gbody);
+            bool ok = glen > 0 && glen < 56;
+            for (int i = 0; ok && i < glen; i++)
+            {
+                unsigned char ch = (unsigned char)gbody[i];
+                if (ch == '<' || ch == '\n' || ch == '\r') ok = false;
+            }
+            if (ok)
+                MultiByteToWideChar(CP_UTF8, 0, gbody, -1, wcountry, 64);
+            free(gbody);
+        }
+    }
+
     EnterCriticalSection(&g_ipCS);
     wcscpy_s(g_ipStr, wip[0] ? wip : L"—");
+    wcscpy_s(g_ipCountry, wcountry);
     LeaveCriticalSection(&g_ipCS);
 
     if (g_hwndForIp) PostMessageW(g_hwndForIp, WM_REDRAW_IP, 0, 0);
@@ -1581,12 +1607,17 @@ static void DrawIpPanel(ID2D1RenderTarget* rt, D2D1_RECT_F area)
     float y = area.top;
 
     wchar_t ip[64];
+    wchar_t country[64];
     EnterCriticalSection(&g_ipCS);
     wcscpy_s(ip, g_ipStr[0] ? g_ipStr : L"…");
+    wcscpy_s(country, g_ipCountry);
     LeaveCriticalSection(&g_ipCS);
 
-    wchar_t text[80];
-    swprintf_s(text, L"IP  %s", ip);
+    wchar_t text[160];
+    if (country[0])
+        swprintf_s(text, L"IP  %s (%s)", ip, country);
+    else
+        swprintf_s(text, L"IP  %s", ip);
     if (y + lh <= area.bottom)
     {
         D2D1_RECT_F r = { area.left, y, area.right, y + lh };
