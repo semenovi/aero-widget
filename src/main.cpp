@@ -118,7 +118,8 @@ static void ApplyBlur(HWND hwnd)
 // -----------------------------------------------------------------------
 // Layout constants
 // -----------------------------------------------------------------------
-static float g_fontScale = 1.5f;          // configurable via config.json "font_scale"
+static float g_fontScale    = 1.5f;        // configurable via config.json "font_scale"
+static bool  g_debugEnabled = false;      // configurable via config.json "debug"
 static float PAD         = 6.f  * g_fontScale;
 static float VEDGE       = 14.f * g_fontScale;
 
@@ -746,7 +747,7 @@ static void SaveDefaultConfig()
     FILE* f = nullptr;
     if (_wfopen_s(&f, path, L"w") == 0 && f)
     {
-        fputs("{\n    \"location\": \"\",\n    \"autostart\": false,\n    \"rss_feed_url\": \"https://habr.com/ru/rss/all/all/\"\n}\n", f);
+        fputs("{\n    \"location\": \"\",\n    \"autostart\": false,\n    \"debug\": false,\n    \"rss_feed_url\": \"https://habr.com/ru/rss/all/all/\"\n}\n", f);
         fclose(f);
     }
 }
@@ -827,6 +828,7 @@ static void SaveWindowState(HWND hwnd)
         "    \"disk_sub_mode\": %d,\n"
         "    \"font_scale\": %.2f,\n"
         "    \"autostart\": %s,\n"
+        "    \"debug\": %s,\n"
         "    \"rss_feed_url\": \"%s\",\n"
         "    \"proc_abs_cpu\": %d,\n"
         "    \"proc_abs_gpu\": %d,\n"
@@ -837,6 +839,7 @@ static void SaveWindowState(HWND hwnd)
         g_cpuMode, g_gpuMode, g_ramMode, g_diskMode, g_diskSubMode,
         (double)g_fontScale,
         g_autostart ? "true" : "false",
+        g_debugEnabled ? "true" : "false",
         escapedRss,
         g_procAbsMode[0] ? 1 : 0,
         g_procAbsMode[1] ? 1 : 0,
@@ -877,16 +880,18 @@ static void SaveWindowState(HWND hwnd)
 }
 
 // -----------------------------------------------------------------------
-// Debug log (appends to weather_debug.log next to the executable)
+// Debug log (appends to aero_widget.log next to the executable when debug=true)
 // -----------------------------------------------------------------------
 static void DbgLog(const char* fmt, ...)
 {
+    if (!g_debugEnabled) return;
+
     wchar_t exeDir[MAX_PATH];
     GetModuleFileNameW(NULL, exeDir, MAX_PATH);
     wchar_t* sl = wcsrchr(exeDir, L'\\');
     if (sl) sl[1] = L'\0';
     wchar_t logPath[MAX_PATH];
-    swprintf_s(logPath, L"%sweather_debug.log", exeDir);
+    swprintf_s(logPath, L"%saero_widget.log", exeDir);
 
     static bool s_firstCall = true;
     const wchar_t* mode = s_firstCall ? L"w" : L"a";
@@ -1058,6 +1063,16 @@ static void LoadConfig()
             g_autostart = (strncmp(p, "true", 4) == 0);
         }
     }
+    // debug: look for "true" literal after the key (default false)
+    {
+        const char* p = strstr(buf, "\"debug\"");
+        if (p)
+        {
+            p += strlen("\"debug\"");
+            while (*p == ' ' || *p == ':' || *p == '\t' || *p == '\n' || *p == '\r') p++;
+            g_debugEnabled = (strncmp(p, "true", 4) == 0);
+        }
+    }
     double fontScale = 0.0;
     if (JsonDouble(buf, "font_scale", &fontScale) && fontScale > 0.0)
     {
@@ -1123,14 +1138,13 @@ static const wchar_t* WeekDay(const char* date)
 }
 
 // Fetch a URL path from wttr.in over HTTPS; caller must free() the result.
-static char* WttrGet(const wchar_t* path, const wchar_t* ua = L"AeroWidget/1.0",
-                     bool doLog = false)
+static char* WttrGet(const wchar_t* path, const wchar_t* ua = L"AeroWidget/1.0")
 {
     wchar_t url[1024];
     swprintf_s(url, L"https://wttr.in%s", path);
 
     HINTERNET hInet = InternetOpenW(ua, INTERNET_OPEN_TYPE_PRECONFIG, nullptr, nullptr, 0);
-    if (!hInet) return nullptr;
+    if (!hInet) { DbgLog("[weather] InternetOpen failed\n"); return nullptr; }
 
     // Increase receive timeout to 90 s — wttr.in sends chunked data slowly
     DWORD recvTimeout = 90000;
@@ -1144,29 +1158,29 @@ static char* WttrGet(const wchar_t* path, const wchar_t* ua = L"AeroWidget/1.0",
 
     if (hUrl)
     {
-        if (doLog)
+        if (g_debugEnabled)
         {
             // Log HTTP status
             DWORD statusCode = 0, scLen = sizeof(statusCode);
             if (HttpQueryInfoW(hUrl, HTTP_QUERY_STATUS_CODE | HTTP_QUERY_FLAG_NUMBER,
                     &statusCode, &scLen, nullptr))
-                DbgLog("HTTP status: %lu\n", statusCode);
+                DbgLog("[weather] HTTP status: %lu\n", statusCode);
             else
-                DbgLog("HTTP status: (unknown)\n");
+                DbgLog("[weather] HTTP status: (unknown)\n");
 
             // Log Content-Length (may be absent for chunked)
             wchar_t clBuf[64] = {}; DWORD clLen = sizeof(clBuf) - 2;
             if (HttpQueryInfoW(hUrl, HTTP_QUERY_CONTENT_LENGTH, clBuf, &clLen, nullptr))
-                DbgLog("Content-Length: %ls\n", clBuf);
+                DbgLog("[weather] Content-Length: %ls\n", clBuf);
             else
-                DbgLog("Content-Length: (absent)\n");
+                DbgLog("[weather] Content-Length: (absent)\n");
 
             // Log Transfer-Encoding
             wchar_t teBuf[64] = {}; DWORD teLen = sizeof(teBuf) - 2;
             if (HttpQueryInfoW(hUrl, HTTP_QUERY_TRANSFER_ENCODING, teBuf, &teLen, nullptr))
-                DbgLog("Transfer-Encoding: %ls\n", teBuf);
+                DbgLog("[weather] Transfer-Encoding: %ls\n", teBuf);
             else
-                DbgLog("Transfer-Encoding: (absent)\n");
+                DbgLog("[weather] Transfer-Encoding: (absent)\n");
         }
 
         const int CAP = 256 * 1024;
@@ -1179,8 +1193,8 @@ static char* WttrGet(const wchar_t* path, const wchar_t* ua = L"AeroWidget/1.0",
             {
                 DWORD toRead = (DWORD)min(4096, CAP - 1 - blen);
                 BOOL rdOk = InternetReadFile(hUrl, body + blen, toRead, &rd);
-                if (doLog)
-                    DbgLog("  iter %d: ReadData ok=%d rd=%lu total=%d\n",
+                if (g_debugEnabled)
+                    DbgLog("[weather]   iter %d: ReadData ok=%d rd=%lu total=%d\n",
                            iter, (int)rdOk, rd, blen + (int)rd);
                 if (!rdOk || rd == 0) break;
                 blen += (int)rd;
@@ -1191,6 +1205,10 @@ static char* WttrGet(const wchar_t* path, const wchar_t* ua = L"AeroWidget/1.0",
         }
         InternetCloseHandle(hUrl);
     }
+    else
+    {
+        DbgLog("[weather] connect failed (hUrl is null)\n");
+    }
     InternetCloseHandle(hInet);
     return body;
 }
@@ -1199,7 +1217,7 @@ static char* WttrGet(const wchar_t* path, const wchar_t* ua = L"AeroWidget/1.0",
 static char* HttpGetUrl(const wchar_t* url, const wchar_t* ua = L"AeroWidget/1.0")
 {
     HINTERNET hInet = InternetOpenW(ua, INTERNET_OPEN_TYPE_PRECONFIG, nullptr, nullptr, 0);
-    if (!hInet) return nullptr;
+    if (!hInet) { DbgLog("[http] InternetOpen failed\n"); return nullptr; }
 
     DWORD recvTimeout = 30000;
     InternetSetOption(hInet, INTERNET_OPTION_RECEIVE_TIMEOUT, &recvTimeout, sizeof(recvTimeout));
@@ -1227,6 +1245,12 @@ static char* HttpGetUrl(const wchar_t* url, const wchar_t* ua = L"AeroWidget/1.0
             if (blen == 0) { free(body); body = nullptr; }
         }
         InternetCloseHandle(hUrl);
+    }
+    else
+    {
+        char urlBuf[256] = {};
+        WideCharToMultiByte(CP_UTF8, 0, url, -1, urlBuf, sizeof(urlBuf) - 1, nullptr, nullptr);
+        DbgLog("[http] connect failed: %.200s\n", urlBuf);
     }
     InternetCloseHandle(hInet);
     return body;
@@ -1314,10 +1338,12 @@ static bool XmlTag(const char* begin, const char* end,
 // -----------------------------------------------------------------------
 static DWORD WINAPI HabrThreadProc(LPVOID)
 {
+    DbgLog("[rss] fetching: %s\n", g_rssFeedUrl);
     wchar_t wFeedUrl[1024];
     MultiByteToWideChar(CP_UTF8, 0, g_rssFeedUrl, -1, wFeedUrl, 1024);
     char* body = HttpGetUrl(wFeedUrl);
-    if (!body) return 0;
+    if (!body) { DbgLog("[rss] fetch failed\n"); return 0; }
+    DbgLog("[rss] fetched %d bytes\n", (int)strlen(body));
 
     HabrArticle* articles = new HabrArticle[MAX_HABR]();
     int count = 0;
@@ -1349,6 +1375,7 @@ static DWORD WINAPI HabrThreadProc(LPVOID)
         p = itemEnd + 7; // past </item>
     }
     free(body);
+    DbgLog("[rss] parsed %d items\n", count);
 
     EnterCriticalSection(&g_habrCS);
     memcpy(g_habr, articles, sizeof(HabrArticle) * count);
@@ -1454,17 +1481,17 @@ static DWORD WINAPI WeatherThreadProc(LPVOID)
     {
         wchar_t path[512];
         swprintf_s(path, L"/%s?format=j1&m", encLoc);
-        DbgLog("=== WeatherThreadProc ===\n");
-        char* body = WttrGet(path, L"AeroWidget/1.0", /*doLog=*/true);
+        DbgLog("[weather] === WeatherThreadProc ===\n");
+        char* body = WttrGet(path, L"AeroWidget/1.0");
         if (body)
         {
             int blen = (int)strlen(body);
-            DbgLog("body length: %d\n", blen);
+            DbgLog("[weather] body length: %d\n", blen);
 
             // Log first 200 chars of body to confirm it looks like JSON
             char preview[201] = {};
             strncpy_s(preview, body, 200);
-            DbgLog("body[0..200]: %.200s\n\n", preview);
+            DbgLog("[weather] body[0..200]: %.200s\n\n", preview);
 
             char tmp[256];
 
@@ -1489,11 +1516,11 @@ static DWORD WINAPI WeatherThreadProc(LPVOID)
             // 3-day forecast.
             {
                 const char* wStart = strstr(body, "\"weather\":");
-                DbgLog("\"weather\":  %s\n", wStart ? "FOUND" : "NOT FOUND");
+                DbgLog("[weather] \"weather\":  %s\n", wStart ? "FOUND" : "NOT FOUND");
 
                 if (wStart)
                 {
-                    DbgLog("offset of \"weather\": %d\n", (int)(wStart - body));
+                    DbgLog("[weather] offset of \"weather\": %d\n", (int)(wStart - body));
 
                     for (int day = 0; day < 3; day++)
                     {
@@ -1503,7 +1530,7 @@ static DWORD WINAPI WeatherThreadProc(LPVOID)
                         bool okMax  = JsonStr(wStart, "maxtempC", day, maxT, sizeof(maxT));
                         bool okMin  = JsonStr(wStart, "mintempC", day, minT, sizeof(minT));
 
-                        DbgLog("day[%d]: date=%s(%d) maxT=%s(%d) minT=%s(%d)\n",
+                        DbgLog("[weather] day[%d]: date=%s(%d) maxT=%s(%d) minT=%s(%d)\n",
                                day,
                                okDate ? date : "FAIL", okDate,
                                okMax  ? maxT : "FAIL", okMax,
@@ -1524,7 +1551,7 @@ static DWORD WINAPI WeatherThreadProc(LPVOID)
         }
         else
         {
-            DbgLog("body is NULL (request failed)\n");
+            DbgLog("[weather] body is NULL (request failed)\n");
         }
     }
 
@@ -1534,12 +1561,12 @@ static DWORD WINAPI WeatherThreadProc(LPVOID)
         wchar_t path[512];
         swprintf_s(path, L"/%s?T&q&0&m", encLoc);
         char* ab = WttrGet(path, L"curl/7.68.0");
-        DbgLog("ascii body: %s\n", ab ? "OK" : "NULL");
+        DbgLog("[weather] ascii body: %s\n", ab ? "OK" : "NULL");
         if (ab)
         {
             char apreview[201] = {};
             strncpy_s(apreview, ab, 200);
-            DbgLog("ascii[0..200]: %.200s\n", apreview);
+            DbgLog("[weather] ascii[0..200]: %.200s\n", apreview);
 
             int lineIdx = 0;
             const char* lp = ab;
@@ -1584,7 +1611,7 @@ static DWORD WINAPI WeatherThreadProc(LPVOID)
 
                 lp = (*le == '\n') ? le + 1 : le;
             }
-            DbgLog("ascii lines parsed: %d\n", lineIdx);
+            DbgLog("[weather] ascii lines parsed: %d\n", lineIdx);
             free(ab);
         }
     }
@@ -1646,19 +1673,35 @@ static DWORD WINAPI IpThreadProc(LPVOID lParam)
         L"https://ifconfig.me/ip",
     };
 
+    DbgLog("[ip] starting IP fetch\n");
     wchar_t wip[64] = L"";
     for (int i = 0; i < (int)(sizeof(kServices)/sizeof(kServices[0])); i++)
     {
+        char svcBuf[128] = {};
+        WideCharToMultiByte(CP_UTF8, 0, kServices[i], -1, svcBuf, sizeof(svcBuf) - 1, nullptr, nullptr);
         char* body = HttpGetUrl(kServices[i], L"AeroWidget/1.0");
         if (body)
         {
             TrimRight(body);
             if (IsValidIp(body))
+            {
                 MultiByteToWideChar(CP_UTF8, 0, body, -1, wip, 64);
+                DbgLog("[ip] got IP from %s: %s\n", svcBuf, body);
+            }
+            else
+            {
+                DbgLog("[ip] %s: invalid response: %.64s\n", svcBuf, body);
+            }
             free(body);
+        }
+        else
+        {
+            DbgLog("[ip] %s: request failed\n", svcBuf);
         }
         if (wip[0]) break;
     }
+    if (!wip[0])
+        DbgLog("[ip] all services failed, IP unavailable\n");
 
     wchar_t wcountry[64] = L"";
     if (wip[0])
@@ -1679,8 +1722,19 @@ static DWORD WINAPI IpThreadProc(LPVOID lParam)
                 if (ch == '<' || ch == '\n' || ch == '\r') ok = false;
             }
             if (ok)
+            {
                 MultiByteToWideChar(CP_UTF8, 0, gbody, -1, wcountry, 64);
+                DbgLog("[ip] country: %s\n", gbody);
+            }
+            else
+            {
+                DbgLog("[ip] country lookup: invalid response (len=%d)\n", glen);
+            }
             free(gbody);
+        }
+        else
+        {
+            DbgLog("[ip] country lookup failed\n");
         }
     }
 
@@ -2212,7 +2266,12 @@ struct HWiNFO_READING {
 static LONG ReadCpuTempHwInfo()
 {
     HANDLE hMap = OpenFileMappingA(FILE_MAP_READ, FALSE, HWINFO_SM_NAME);
-    if (!hMap) return 0;
+    if (!hMap)
+    {
+        static int s_failCount = 0;
+        if (++s_failCount == 1) DbgLog("[hwinfo] CPU temp: shared memory not available\n");
+        return 0;
+    }
 
     const void* pView = MapViewOfFile(hMap, FILE_MAP_READ, 0, 0, 0);
     if (!pView) { CloseHandle(hMap); return 0; }
@@ -2274,7 +2333,12 @@ static LONG ReadCpuTempHwInfo()
 static LONG ReadRamTempHwInfo()
 {
     HANDLE hMap = OpenFileMappingA(FILE_MAP_READ, FALSE, HWINFO_SM_NAME);
-    if (!hMap) return 0;
+    if (!hMap)
+    {
+        static int s_failCount = 0;
+        if (++s_failCount == 1) DbgLog("[hwinfo] RAM temp: shared memory not available\n");
+        return 0;
+    }
 
     const void* pView = MapViewOfFile(hMap, FILE_MAP_READ, 0, 0, 0);
     if (!pView) { CloseHandle(hMap); return 0; }
@@ -2318,7 +2382,12 @@ static LONG ReadRamTempHwInfo()
 static LONG ReadDiskTempHwInfo(int diskIdx)
 {
     HANDLE hMap = OpenFileMappingA(FILE_MAP_READ, FALSE, HWINFO_SM_NAME);
-    if (!hMap) return 0;
+    if (!hMap)
+    {
+        static int s_failCount = 0;
+        if (++s_failCount == 1) DbgLog("[hwinfo] disk temp: shared memory not available\n");
+        return 0;
+    }
     const void* pView = MapViewOfFile(hMap, FILE_MAP_READ, 0, 0, 0);
     if (!pView) { CloseHandle(hMap); return 0; }
 
@@ -3378,6 +3447,10 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
                     nvsmi, MAX_PATH);
                 g_hNvml = LoadLibraryW(nvsmi);
             }
+            if (!g_hNvml)
+            {
+                DbgLog("[nvml] nvml.dll not found — NVIDIA GPU temp via NVML unavailable\n");
+            }
             if (g_hNvml)
             {
                 // Prefer versioned entry points introduced in NVML r304+
@@ -3404,10 +3477,16 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
 
                 if (!g_nvmlDevice)
                 {
+                    DbgLog("[nvml] device init failed (pfnInit=%d pfnHandle=%d getTemp=%d)\n",
+                           pfnInit != nullptr, pfnHandle != nullptr, g_nvmlGetTemp != nullptr);
                     if (g_nvmlShutdown) g_nvmlShutdown();
                     FreeLibrary(g_hNvml);
                     g_hNvml       = NULL;
                     g_nvmlGetTemp = NULL;
+                }
+                else
+                {
+                    DbgLog("[nvml] initialized, GPU temp via NVML enabled\n");
                 }
             }
         }
