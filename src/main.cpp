@@ -177,7 +177,8 @@ static D2D1_RECT_F  g_cpuChartRect = {};  // CPU row rect (local coords), for cl
 // -----------------------------------------------------------------------
 static int          g_gpuMode       = 0; // 0=core load, 1=VRAM %, 2=temp, 3=core+VRAM, 4=core+VRAM+temp
 static Chart        g_gpuVramChart  = {};
-static Chart        g_gpuTempChart  = {};
+static Chart        g_gpuTempChart  = {};       // regular (edge) GPU temperature
+static Chart        g_gpuHotspotChart = {};      // GPU hot-spot temperature (HWiNFO only)
 static PDH_HCOUNTER g_pdhGpuTempCtr = NULL;
 static D2D1_RECT_F  g_gpuChartRect  = {};
 
@@ -400,6 +401,7 @@ static void FlushDisplayValues()
     for (int i = 0; i < g_physicalCoreCount; ++i) flush(g_physicalCharts[i]);
     flush(g_gpuVramChart);
     flush(g_gpuTempChart);
+    flush(g_gpuHotspotChart);
     flush(g_cpuTempChart);
     flush(g_ramTempChart);
     flush(g_diskTotalReadChart);
@@ -552,6 +554,130 @@ static void DrawChart(ID2D1RenderTarget* rt, const Chart& c,
     }
 
     pBrush->Release();
+}
+
+// Draw the GPU temperature panel: hot-spot temperature in black followed by the regular
+// (edge) temperature in gray parentheses, both on the label and on the plotted lines.
+// Falls back to the plain single-series DrawChart when no hot-spot reading is available
+// (e.g. HWiNFO64 isn't running).
+static void DrawGpuTempChart(ID2D1RenderTarget* rt, const Chart& hot, const Chart& base,
+                              D2D1_RECT_F area,
+                              IDWriteTextFormat* fmtL, IDWriteTextFormat* fmtR,
+                              int maxSamples = CHART_SAMPLES,
+                              bool absOnly = false)
+{
+    bool haveHot = hot.displayAbsStr[0] && wcscmp(hot.displayAbsStr, L"N/A") != 0;
+    if (!haveHot)
+    {
+        DrawChart(rt, base, area, fmtL, fmtR, maxSamples, absOnly);
+        return;
+    }
+
+    const float margin = 8.f;
+    const float labelH = g_fontSize * 1.4f;
+
+    D2D1_RECT_F labelArea = { area.left + margin, area.top, area.right - margin, area.top + labelH };
+    D2D1_RECT_F plotArea  = { area.left + margin, area.top + labelH, area.right - margin, area.bottom };
+
+    ID2D1SolidColorBrush* pBlack = nullptr;
+    ID2D1SolidColorBrush* pGray  = nullptr;
+    if (FAILED(rt->CreateSolidColorBrush(D2D1::ColorF(0.f, 0.f, 0.f, 1.f), &pBlack)))
+        return;
+    if (FAILED(rt->CreateSolidColorBrush(D2D1::ColorF(0.3f, 0.3f, 0.3f, 1.f), &pGray)))
+    {
+        pBlack->Release();
+        return;
+    }
+
+    bool haveBase = base.displayAbsStr[0] && wcscmp(base.displayAbsStr, L"N/A") != 0;
+
+    // Value text: hot-spot temp (black) followed by the regular temp in gray parentheses.
+    wchar_t valBuf[128] = {};
+    UINT32  hotLen = 0;
+    if (fmtR)
+    {
+        hotLen = (UINT32)wcslen(hot.displayAbsStr);
+        if (haveBase)
+            swprintf_s(valBuf, L"%s (%s)", hot.displayAbsStr, base.displayAbsStr);
+        else
+            wcscpy_s(valBuf, hot.displayAbsStr);
+    }
+
+    float valWidth = 0.f;
+    IDWriteTextLayout* vl = nullptr;
+    if (fmtR && valBuf[0] && g_pDWFactory)
+    {
+        float areaW = labelArea.right - labelArea.left;
+        if (SUCCEEDED(g_pDWFactory->CreateTextLayout(
+                valBuf, (UINT32)wcslen(valBuf), fmtR, areaW, labelH, &vl)))
+        {
+            DWRITE_TEXT_METRICS tm = {};
+            vl->GetMetrics(&tm);
+            valWidth = tm.widthIncludingTrailingWhitespace;
+            if (valWidth > areaW) valWidth = areaW;
+
+            UINT32 totalLen = (UINT32)wcslen(valBuf);
+            if (haveBase && hotLen < totalLen)
+            {
+                DWRITE_TEXT_RANGE grayRange = { hotLen, totalLen - hotLen };
+                vl->SetDrawingEffect(pGray, grayRange);
+            }
+        }
+    }
+
+    // Draw name truncated to the space not occupied by the value (4 px gap).
+    if (fmtL)
+    {
+        const float gap = 4.f;
+        float nameMaxW = (labelArea.right - labelArea.left) - valWidth - gap;
+        if (nameMaxW < 0.f) nameMaxW = 0.f;
+        D2D1_RECT_F nameRect = { labelArea.left, labelArea.top,
+                                  labelArea.left + nameMaxW, labelArea.bottom };
+        DrawTextEllipsis(rt, base.name, (UINT32)wcslen(base.name), fmtL, nameRect, pBlack);
+    }
+
+    // Draw value (right-aligned via fmtR's trailing alignment baked into the layout box).
+    if (vl)
+    {
+        rt->DrawTextLayout({ labelArea.left, labelArea.top }, vl, pBlack);
+        vl->Release();
+    }
+
+    rt->DrawRectangle(plotArea, pBlack, 0.75f);
+
+    const int n = min(min(hot.count, base.count), maxSamples);
+    if (n >= 2)
+    {
+        const float left   = plotArea.left   + 2.f;
+        const float right  = plotArea.right  - 2.f;
+        const float top    = plotArea.top    + 2.f;
+        const float bottom = plotArea.bottom - 2.f;
+        const float pw     = right  - left;
+        const float ph     = bottom - top;
+
+        auto drawSeries = [&](const Chart& c, ID2D1SolidColorBrush* brush) {
+            const int start = (c.head - n + CHART_SAMPLES) % CHART_SAMPLES;
+            for (int i = 1; i < n; ++i)
+            {
+                const int i0 = (start + i - 1) % CHART_SAMPLES;
+                const int i1 = (start + i)     % CHART_SAMPLES;
+
+                const float x0 = left + (float)(i - 1) / (n - 1) * pw;
+                const float y0 = bottom - (float)c.values[i0] * ph;
+                const float x1 = left + (float)i         / (n - 1) * pw;
+                const float y1 = bottom - (float)c.values[i1] * ph;
+
+                rt->DrawLine({ x0, y0 }, { x1, y1 }, brush, 0.75f);
+            }
+        };
+
+        // Gray (regular temp) first, black (hot-spot) drawn on top so it stays legible.
+        if (haveBase) drawSeries(base, pGray);
+        drawSeries(hot, pBlack);
+    }
+
+    pGray->Release();
+    pBlack->Release();
 }
 
 // Draw a process list panel: title, separator line, then entries (name left, value right).
@@ -2377,6 +2503,51 @@ static LONG ReadRamTempHwInfo()
     return result;
 }
 
+// Returns GPU hot-spot temperature in tenths of °C from HWiNFO shared memory, or 0 if
+// unavailable (requires HWiNFO64 with Shared Memory Support; NVML has no hot-spot sensor).
+static LONG ReadGpuHotspotHwInfo()
+{
+    HANDLE hMap = OpenFileMappingA(FILE_MAP_READ, FALSE, HWINFO_SM_NAME);
+    if (!hMap)
+    {
+        static int s_failCount = 0;
+        if (++s_failCount == 1) DbgLog("[hwinfo] GPU hot spot: shared memory not available\n");
+        return 0;
+    }
+
+    const void* pView = MapViewOfFile(hMap, FILE_MAP_READ, 0, 0, 0);
+    if (!pView) { CloseHandle(hMap); return 0; }
+
+    LONG result = 0;
+    const auto* hdr = static_cast<const HWiNFO_HEADER*>(pView);
+
+    if (hdr->dwSignature == HWINFO_SM_SIG && hdr->dwNumReadingElements > 0)
+    {
+        const BYTE* base   = static_cast<const BYTE*>(pView);
+        const BYTE* rdBase = base + hdr->dwOffsetOfReadingSection;
+        DWORD       stride = hdr->dwSizeOfReadingElement;
+        DWORD       count  = hdr->dwNumReadingElements;
+
+        double maxTemp = 0.0;
+        for (DWORD i = 0; i < count; ++i)
+        {
+            const auto* r = reinterpret_cast<const HWiNFO_READING*>(rdBase + i * stride);
+            if (r->tReading != 1) continue;
+            if (r->Value <= 0.0 || r->Value > 150.0) continue;
+
+            const char* lbl = r->szLabelOrig[0] ? r->szLabelOrig : r->szLabelUser;
+            if (strstr(lbl, "GPU") && strstr(lbl, "Hot Spot"))
+                if (r->Value > maxTemp) maxTemp = r->Value;
+        }
+        if (maxTemp > 0.0)
+            result = (LONG)(maxTemp * 10.0 + 0.5);
+    }
+
+    UnmapViewOfFile(pView);
+    CloseHandle(hMap);
+    return result;
+}
+
 // Returns temperature of physical disk `diskIdx` (0-based) in tenths of °C from HWiNFO shared
 // memory, grouping readings by sensor. Returns 0 if HWiNFO is not running or no data.
 static LONG ReadDiskTempHwInfo(int diskIdx)
@@ -2707,6 +2878,10 @@ static void SampleMetrics()
                             { tempC = it[i].FmtValue.doubleValue; gotTemp = true; break; }
                 });
             PushTempChart(g_gpuTempChart, tempC, gotTemp);
+
+            // GPU hot-spot temperature: HWiNFO64 shared memory only (NVML has no such sensor).
+            LONG hotspotDeciC = ReadGpuHotspotHwInfo();
+            PushTempChart(g_gpuHotspotChart, hotspotDeciC / 10.0, hotspotDeciC > 0);
         }
     }
 
@@ -3095,7 +3270,7 @@ static void DrawChartPanel(ID2D1RenderTarget* rt, int dataIdx, D2D1_RECT_F area)
         else if (g_gpuMode == 1)
             DrawChart(rt, g_gpuVramChart, area, g_pChartFmtL, g_pChartFmtR);
         else if (g_gpuMode == 2)
-            DrawChart(rt, g_gpuTempChart, area, g_pChartFmtL, g_pChartFmtR);
+            DrawGpuTempChart(rt, g_gpuHotspotChart, g_gpuTempChart, area, g_pChartFmtL, g_pChartFmtR);
         else if (g_gpuMode == 3) {
             drawTitle(g_charts[1].name);
             float halfW = colW/2.f, cY = y+titleH; int ms = max(2, CHART_SAMPLES/2);
@@ -3107,7 +3282,7 @@ static void DrawChartPanel(ID2D1RenderTarget* rt, int dataIdx, D2D1_RECT_F area)
             Chart core = g_charts[1]; core.displayAbsStr[0] = L'\0';
             DrawChart(rt, core,           {x,        cY, x+tW,      y+rowH}, nullptr, g_pChartFmtR, ms);
             DrawChart(rt, g_gpuVramChart, {x+tW,     cY, x+2.f*tW,  y+rowH}, nullptr, g_pChartFmtR, ms);
-            DrawChart(rt, g_gpuTempChart, {x+2.f*tW, cY, x+colW,    y+rowH}, nullptr, g_pChartFmtR, ms, true);
+            DrawGpuTempChart(rt, g_gpuHotspotChart, g_gpuTempChart, {x+2.f*tW, cY, x+colW, y+rowH}, nullptr, g_pChartFmtR, ms, true);
         }
     }
     else if (dataIdx == 2) // RAM
