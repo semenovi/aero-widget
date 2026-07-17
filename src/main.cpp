@@ -120,6 +120,7 @@ static void ApplyBlur(HWND hwnd)
 // -----------------------------------------------------------------------
 static float g_fontScale    = 1.5f;        // configurable via config.json "font_scale"
 static bool  g_debugEnabled = false;      // configurable via config.json "debug"
+static bool  g_showVertDividers = true;   // configurable via config.json "show_vert_dividers"
 static float PAD         = 6.f  * g_fontScale;
 static float VEDGE       = 14.f * g_fontScale;
 
@@ -234,6 +235,7 @@ static float g_colDivX[MAX_COLS];                          // X of divider after
 static bool  g_colDivXSet[MAX_COLS];                       // loaded from config?
 static float g_colDivY[MAX_COLS][MAX_PANELS_PER_COL];      // Y between row r and r+1 in col c
 static bool  g_colDivYSet[MAX_COLS][MAX_PANELS_PER_COL];
+static bool  g_colShowYDiv[MAX_COLS];                      // per-column horizontal divider visibility, configurable via config.json "col_N_show_ydiv"
 
 static int g_draggingColDivIdx = -1;   // which vertical divider is dragged (-1 = none)
 static int g_draggingRowDivCol = -1;   // column of dragged horizontal divider (-1 = none)
@@ -357,6 +359,8 @@ static void SetDefaultLayout()
     strcpy_s(g_colPanels[2][1], "gpu_proc");
     strcpy_s(g_colPanels[2][2], "ram_proc");
     strcpy_s(g_colPanels[2][3], "disk_proc");
+
+    for (int c = 0; c < MAX_COLS; c++) g_colShowYDiv[c] = true;
 }
 
 // Initialize dividers to auto-spaced defaults (for any not loaded from config).
@@ -955,6 +959,7 @@ static void SaveWindowState(HWND hwnd)
         "    \"font_scale\": %.2f,\n"
         "    \"autostart\": %s,\n"
         "    \"debug\": %s,\n"
+        "    \"show_vert_dividers\": %s,\n"
         "    \"rss_feed_url\": \"%s\",\n"
         "    \"proc_abs_cpu\": %d,\n"
         "    \"proc_abs_gpu\": %d,\n"
@@ -966,6 +971,7 @@ static void SaveWindowState(HWND hwnd)
         (double)g_fontScale,
         g_autostart ? "true" : "false",
         g_debugEnabled ? "true" : "false",
+        g_showVertDividers ? "true" : "false",
         escapedRss,
         g_procAbsMode[0] ? 1 : 0,
         g_procAbsMode[1] ? 1 : 0,
@@ -982,6 +988,7 @@ static void SaveWindowState(HWND hwnd)
             fputs(g_colPanels[c][r], f);
         }
         fputs("\",\n", f);
+        fprintf(f, "    \"col_%d_show_ydiv\": %s,\n", c + 1, g_colShowYDiv[c] ? "true" : "false");
     }
     // Vertical (column) dividers
     for (int k = 0; k < g_colCount - 1; k++)
@@ -1199,6 +1206,16 @@ static void LoadConfig()
             g_debugEnabled = (strncmp(p, "true", 4) == 0);
         }
     }
+    // vertical divider visibility: look for "true"/"false" literal after the key (default true)
+    {
+        const char* p = strstr(buf, "\"show_vert_dividers\"");
+        if (p)
+        {
+            p += strlen("\"show_vert_dividers\"");
+            while (*p == ' ' || *p == ':' || *p == '\t' || *p == '\n' || *p == '\r') p++;
+            g_showVertDividers = (strncmp(p, "false", 5) != 0);
+        }
+    }
     double fontScale = 0.0;
     if (JsonDouble(buf, "font_scale", &fontScale) && fontScale > 0.0)
     {
@@ -1221,6 +1238,17 @@ static void LoadConfig()
                 snprintf(key, sizeof(key), "col_%d", c + 1);
                 if (JsonStr(buf, key, 0, val, sizeof(val)) && val[0])
                     g_colPanelCount[c] = ParsePanelList(val, g_colPanels[c], MAX_PANELS_PER_COL);
+
+                // Per-column horizontal divider visibility
+                char ydivKey[32];
+                snprintf(ydivKey, sizeof(ydivKey), "\"col_%d_show_ydiv\"", c + 1);
+                const char* p = strstr(buf, ydivKey);
+                if (p)
+                {
+                    p += strlen(ydivKey);
+                    while (*p == ' ' || *p == ':' || *p == '\t' || *p == '\n' || *p == '\r') p++;
+                    g_colShowYDiv[c] = (strncmp(p, "false", 5) != 0);
+                }
             }
         }
         // Vertical dividers
@@ -3432,7 +3460,7 @@ static void UpdateLayeredContent(HWND hwnd)
                 DispatchPanel(g_pDCRT, g_colPanels[c][r], {colL, rowT, colR, rowB});
 
                 // Horizontal row divider below this panel
-                if (r < n - 1)
+                if (r < n - 1 && g_colShowYDiv[c])
                 {
                     if (ID2D1SolidColorBrush* pD = MakeBrush())
                     {
@@ -3443,7 +3471,7 @@ static void UpdateLayeredContent(HWND hwnd)
             }
 
             // Vertical divider after this column
-            if (c < g_colCount - 1)
+            if (c < g_colCount - 1 && g_showVertDividers)
             {
                 if (ID2D1SolidColorBrush* pD = MakeBrush())
                 {
