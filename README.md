@@ -15,7 +15,7 @@ A lightweight Windows desktop widget with an Acrylic/Aero blur background. Displ
 
 - **System monitoring**
   - CPU — total load with actual frequency (GHz), per-logical-core, per-physical-core, or load+temperature view (click to cycle)
-  - GPU — core load, VRAM usage, temperature, or combined view (click to cycle); NVML support for NVIDIA RTX GPUs
+  - GPU — core load, VRAM usage, temperature, or combined view (click to cycle); NVML support for NVIDIA RTX GPUs; GPU hot-spot temperature (e.g. AMD 5000-series) shown alongside edge temperature when available via HWiNFO64
   - RAM — used / total
   - Disk I/O — aggregate or per-disk view (click to cycle)
 - **Per-process top lists** — CPU, GPU, RAM, and Disk top consumers; click a tile to toggle between percent and absolute values; hover freezes the list so you can read it; right-click an entry to kill the process
@@ -23,7 +23,7 @@ A lightweight Windows desktop widget with an Acrylic/Aero blur background. Displ
 - **RSS feed** — configurable RSS source (default: Habr), refreshed on a configurable interval; click a headline to open it in the browser
 - **Acrylic / Aero blur** — uses the undocumented `SetWindowCompositionAttribute` API with DWM fallback, so it works across Windows 10 and 11; rounded corners via DWM
 - **Resizable window** — drag any edge or corner to resize, in addition to dragging the internal panel dividers
-- **Configurable column layout** — number of columns and panel assignment per column are fully configurable in `config.json`; vertical and horizontal dividers appear automatically and are draggable
+- **Configurable column layout** — number of columns and panel assignment per column are fully configurable in `config.json`; vertical and horizontal dividers appear automatically and are draggable; divider visibility can be toggled off per axis/column
 - **Persistent layout** — window position, size, and divider positions are saved to `config.json` next to the executable
 - **Configurable font scale** — set `font_scale` in `config.json` to scale all text
 - **CPU temperature sources** — automatically tries HWiNFO64 shared memory, then OpenHardwareMonitor WMI, then LibreHardwareMonitor WMI, then MSAcpi thermal zone, then PDH; no manual configuration needed
@@ -32,7 +32,7 @@ A lightweight Windows desktop widget with an Acrylic/Aero blur background. Displ
 
 - Windows 10 or Windows 11 (64-bit recommended)
 - NVIDIA GPU with drivers that ship `nvml.dll` for GPU temperature (optional; falls back to PDH)
-- [HWiNFO64](https://www.hwinfo.com/) with **Shared Memory Support** enabled for best CPU temperature coverage on AMD Ryzen (optional; other sources are tried automatically)
+- [HWiNFO64](https://www.hwinfo.com/) with **Shared Memory Support** enabled for best CPU temperature coverage on AMD Ryzen, and for GPU hot-spot temperature (e.g. AMD 5000-series GPUs) — NVML has no hot-spot sensor (optional; other sources are tried automatically)
 
 ## Building
 
@@ -63,16 +63,21 @@ On first launch a `config.json` file is created next to the executable. You can 
     "disk_mode": 0,
     "disk_sub_mode": 0,
     "font_scale": 1.5,
-    "rss_feed_url": "https://habr.com/ru/rss/all/all/",
     "autostart": false,
+    "debug": false,
+    "show_vert_dividers": true,
+    "rss_feed_url": "https://habr.com/ru/rss/all/all/",
     "proc_abs_cpu": 0,
     "proc_abs_gpu": 0,
     "proc_abs_ram": 0,
     "proc_abs_disk": 0,
     "col_count": 3,
     "col_1": "weather|ip|rss",
+    "col_1_show_ydiv": true,
     "col_2": "cpu_chart|gpu_chart|ram_chart|disk_chart",
-    "col_3": "cpu_proc|gpu_proc|ram_proc|disk_proc"
+    "col_2_show_ydiv": true,
+    "col_3": "cpu_proc|gpu_proc|ram_proc|disk_proc",
+    "col_3_show_ydiv": true
 }
 ```
 
@@ -90,8 +95,10 @@ On first launch a `config.json` file is created next to the executable. You can 
 | `disk_mode` | Disk index: `0` aggregate, `1`–`N` individual disk (auto-saved) |
 | `disk_sub_mode` | Disk sub-mode: `0` single value, `1` read+write, `2` read+write+temp (auto-saved) |
 | `font_scale` | Global text scale factor (default `1.5`) |
-| `rss_feed_url` | RSS feed URL (default: Habr all articles); change to any valid RSS 2.0 feed |
 | `autostart` | Launch with Windows (auto-saved) |
+| `debug` | Enable verbose debug logging to `weather_debug.log` (default `false`) |
+| `show_vert_dividers` | Show/hide the draggable vertical dividers between columns (default `true`) |
+| `rss_feed_url` | RSS feed URL (default: Habr all articles); change to any valid RSS 2.0 feed |
 | `proc_abs_cpu/gpu/ram/disk` | `1` = show absolute values in process lists, `0` = percent (auto-saved) |
 
 ### Layout keys
@@ -100,10 +107,11 @@ On first launch a `config.json` file is created next to the executable. You can 
 |-----|-------------|
 | `col_count` | Number of columns (`1`–`8`) |
 | `col_N` | Pipe-separated list of panels for column N (e.g. `"weather\|ip\|rss"`) |
+| `col_N_show_ydiv` | Show/hide the horizontal dividers inside column N (default `true`) |
 | `col_div_K` | X position of the vertical divider between column K and K+1 (auto-saved on drag-end) |
 | `col_N_ydiv_R` | Y position of the R-th horizontal divider inside column N (auto-saved on drag-end) |
 
-Vertical dividers (`col_div_K`) and horizontal dividers (`col_N_ydiv_R`) are optional — if omitted, panels are spaced equally and dividers can be dragged to adjust.
+Vertical dividers (`col_div_K`) and horizontal dividers (`col_N_ydiv_R`) are optional — if omitted, panels are spaced equally and dividers can be dragged to adjust. Set `show_vert_dividers` or `col_N_show_ydiv` to `false` to hide dividers along that axis without changing panel spacing.
 
 #### Available panel types
 
