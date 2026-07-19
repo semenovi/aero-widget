@@ -32,3 +32,4 @@ Desktop.ini
 obj/*
 .claude/
 bin/
+tools/nvapi_probe/
