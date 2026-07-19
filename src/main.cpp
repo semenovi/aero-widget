@@ -2612,9 +2612,13 @@ static LONG ReadDiskTempHwInfo(int diskIdx)
             if (r->Value <= 0.0 || r->Value > 150.0) continue;
 
             const char* lbl = r->szLabelOrig[0] ? r->szLabelOrig : r->szLabelUser;
+            // Note: deliberately no bare "Temperature" match here — it's too broad and
+            // pulls in unrelated sensors (e.g. "SPD Hub Temperature" for RAM), which would
+            // steal a disk slot since they can appear before the real drive sensor in the
+            // shared memory reading order.
             bool isDisk = strstr(lbl, "Drive")  || strstr(lbl, "SSD") ||
                           strstr(lbl, "HDD")    || strstr(lbl, "NVMe") ||
-                          strstr(lbl, "M.2")    || strstr(lbl, "Temperature");
+                          strstr(lbl, "M.2");
             if (!isDisk) continue;
             if (strstr(lbl, "CPU") || strstr(lbl, "GPU") ||
                 strstr(lbl, "DIMM") || strstr(lbl, "RAM")) continue;
