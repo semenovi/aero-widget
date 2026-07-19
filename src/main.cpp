@@ -2515,9 +2515,10 @@ static LONG ReadRamTempHwInfo()
             if (r->Value <= 0.0 || r->Value > 150.0) continue;
 
             const char* lbl = r->szLabelOrig[0] ? r->szLabelOrig : r->szLabelUser;
-            if (strstr(lbl, "DIMM")   ||
-                strstr(lbl, "Memory") ||
-                (strstr(lbl, "RAM") && !strstr(lbl, "GPU")))
+            if (strstr(lbl, "GPU")) continue;  // e.g. "GPU Memory Junction Temperature"
+
+            if (strstr(lbl, "DIMM") || strstr(lbl, "Memory") ||
+                strstr(lbl, "RAM")  || strstr(lbl, "SPD"))
             {
                 if (r->Value > maxTemp) maxTemp = r->Value;
             }
